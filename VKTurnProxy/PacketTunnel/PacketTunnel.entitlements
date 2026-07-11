@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.networking.networkextension</key>
+	<array>
+		<string>packet-tunnel-provider</string>
+	</array>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.vkturnproxy.app</string>
+	</array>
+	<!-- Shared keychain group for the VKAuth logged-in cookie (VKCookieStore),
+	     read by the extension at startTunnel. Must match VKTurnProxy.entitlements. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.vkturnproxy.shared</string>
+	</array>
+	<!-- Required for NEHotspotNetwork.fetchCurrent in PacketTunnelProvider
+	     to return non-nil network data. Without this, fetchCurrent silently
+	     returns nil even from a VPN extension context (verified 2026-05-11
+	     build 78: zero ssid="..." entries in [PathMonitor] log lines).
+	     wifi-info is the lighter-weight option vs HotspotConfiguration —
+	     read-only access to current WiFi network metadata, no joining /
+	     configuring capability. -->
+	<key>com.apple.developer.networking.wifi-info</key>
+	<true/>
+</dict>
+</plist>

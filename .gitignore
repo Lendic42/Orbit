@@ -1,0 +1,46 @@
+# Build artifacts
+WireGuardBridge/build/
+# Archive + export output (script-generated).
+build_output/
+# Bare-name Go binaries produced by `go build .` without -o.
+/WireGuardBridge/WireGuardBridge
+/turn_bw_test
+/turn_bw_server
+/tools/turn_srtp_server/turn_srtp_server
+/tools/turn_srtp_test/turn_srtp_test
+
+# Xcode
+*.xcuserdata
+# Per-user Xcode dir inside .xcodeproj / .xcworkspace (dir, not file).
+xcuserdata/
+*.xcworkspace
+DerivedData/
+build/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Go
+vendor/
+*.xcuserdata
+# go test with -memprofile/-c leaves <pkg>.test binaries
+*.test
+
+# App Store Connect API credentials (Issuer ID / Key ID / p8 path)
+AppStoreConnect.env
+
+# Private local-only notes (design docs for in-progress refactors etc.).
+# Anything placed in this directory is intentionally kept off GitHub.
+.private-notes/
+
+# local scripts
+release.sh
+install.sh
+idev.sh
+iphone.tcpdump.sh
+WireGuardBridge/build/

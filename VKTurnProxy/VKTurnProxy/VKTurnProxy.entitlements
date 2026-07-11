@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.networking.networkextension</key>
+	<array>
+		<string>packet-tunnel-provider</string>
+	</array>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.vkturnproxy.app</string>
+	</array>
+	<!-- Shared keychain group for the VKAuth logged-in cookie (VKCookieStore).
+	     Same group in PacketTunnel.entitlements so the extension can read it.
+	     $(AppIdentifierPrefix) expands to the team id ("CDMQ33VFQC.") at build. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.vkturnproxy.shared</string>
+	</array>
+	<!-- See PacketTunnel.entitlements for the rationale; mirrored here
+	     defensively in case Apple's entitlement check looks at the host
+	     app bundle as well. -->
+	<key>com.apple.developer.networking.wifi-info</key>
+	<true/>
+</dict>
+</plist>
