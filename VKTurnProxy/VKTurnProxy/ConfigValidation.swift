@@ -98,18 +98,18 @@ enum ConfigValidation {
 
     static func vkLink(_ s: String) -> Issue? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { return Issue(.error, "VK call link is required.") }
+        if t.isEmpty { return Issue(.error, "Нужна ссылка VK-звонка.") }
         let token = t.split(separator: "/").last.map(String.init) ?? ""
         if token.isEmpty || token == "REPLACE_ME" {
-            return Issue(.warning, "Doesn't look like a VK call link / token.")
+            return Issue(.warning, "Не похоже на ссылку или токен VK-звонка.")
         }
         return nil
     }
 
     static func peerAddress(_ s: String) -> Issue? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { return Issue(.error, "Proxy server is required (host:port).") }
-        if !isHostPort(t) { return Issue(.error, "Must be host:port with a numeric port.") }
+        if t.isEmpty { return Issue(.error, "Укажите прокси-сервер в формате хост:порт.") }
+        if !isHostPort(t) { return Issue(.error, "Нужен формат хост:порт с числовым портом.") }
         return nil
     }
 
@@ -119,21 +119,21 @@ enum ConfigValidation {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty { return nil }
         if !isHostPort(t) {
-            return Issue(.warning, "Not a valid IP:port — it will be ignored (VK's relay is used).")
+            return Issue(.warning, "Неверный IP:порт — поле будет проигнорировано, используется relay VK.")
         }
         return nil
     }
 
     /// Only meaningful in SRTP+WRAP mode.
     static func wrapKeyHex(_ s: String) -> Issue? {
-        if !isHex64(s) { return Issue(.error, "WRAP key must be 64 hex characters (server -gen-wrap-key).") }
+        if !isHex64(s) { return Issue(.error, "WRAP-ключ должен содержать 64 hex-символа (ключ сервера -gen-wrap-key).") }
         return nil
     }
 
     /// Only meaningful in SRTP-WRAP-A mode.
     static func wrapAPassword(_ s: String) -> Issue? {
         if s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return Issue(.error, "Server password is required — derives the obfuscation key and authenticates GETCONF.")
+            return Issue(.error, "Нужен пароль сервера: из него создаётся ключ и выполняется авторизация GETCONF.")
         }
         return nil
     }
@@ -143,10 +143,10 @@ enum ConfigValidation {
     static func wgKey(_ s: String, label: String, required: Bool) -> Issue? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty {
-            return required ? Issue(.error, "\(label) is required (base64 32-byte key).") : nil
+            return required ? Issue(.error, "Нужно заполнить поле «\(label)» (ключ base64 на 32 байта).") : nil
         }
         if !isWgKey(t) {
-            return Issue(required ? .error : .warning, "\(label) must be a base64 32-byte WireGuard key.")
+            return Issue(required ? .error : .warning, "Поле «\(label)» должно быть ключом WireGuard base64 на 32 байта.")
         }
         return nil
     }
@@ -155,8 +155,8 @@ enum ConfigValidation {
     /// doesn't look like ip/prefix is a (non-blocking) warning.
     static func tunnelAddress(_ s: String) -> Issue? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { return Issue(.error, "Tunnel address is required (e.g. 192.168.102.3/24).") }
-        if !looksLikeCIDR(t) { return Issue(.warning, "Should look like ip/prefix (e.g. 192.168.102.3/24).") }
+        if t.isEmpty { return Issue(.error, "Укажите адрес туннеля, например 192.168.102.3/24.") }
+        if !looksLikeCIDR(t) { return Issue(.warning, "Ожидается формат IP/префикс, например 192.168.102.3/24.") }
         return nil
     }
 
@@ -165,13 +165,9 @@ enum ConfigValidation {
         if t.isEmpty { return nil }
         let parts = t.split(whereSeparator: { $0 == "," || $0 == " " }).map(String.init)
         if parts.contains(where: { !looksLikeIP($0) }) {
-            return Issue(.warning, "Should be IP address(es), comma-separated (e.g. 1.1.1.1).")
+            return Issue(.warning, "Укажите IP-адреса через запятую, например 1.1.1.1.")
         }
         return nil
     }
 
-    // allowedIPs validator removed 2026-06-11 with the UI field — allowedIPs is
-    // pinned to 0.0.0.0/0 (WireGuard cryptokey routing must be full under
-    // includeAllNetworks=true) and is no longer user-editable, so there's
-    // nothing to validate. looksLikeCIDR is still used by tunnelAddress above.
 }

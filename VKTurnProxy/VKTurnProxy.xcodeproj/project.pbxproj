@@ -35,6 +35,9 @@
 		F32EA8BA9CCC4E95BD4DFA12 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 605ED1D89D0F1886A8414767 /* NetworkExtension.framework */; };
 		F5781EB3D4D7E0467DC2A5F5 /* SharedLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = A648919F90B0D8CBE826BC6E /* SharedLogger.swift */; };
 		FD1864DD0B5915A3945CE086 /* BackupManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D13B015BF30B930DDDB8BBF /* BackupManager.swift */; };
+		A10000000000000000000001 /* OrbitWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000011 /* OrbitWidget.swift */; };
+		A10000000000000000000002 /* OrbitWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* OrbitWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A20000000000000000000001 /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* AppIntents.framework */; settings = {ATTRIBUTES = (Weak, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -44,6 +47,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = DC014AC2B8038EB7433CDED3;
 			remoteInfo = PacketTunnel;
+		};
+		A10000000000000000000020 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 5024C6C147B3FDF72E10E537 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A10000000000000000000030;
+			remoteInfo = OrbitWidget;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -57,6 +67,17 @@
 				4FB5626AA1842BFC42564DBF /* PacketTunnel.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A10000000000000000000021 /* Embed Widget Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A10000000000000000000002 /* OrbitWidget.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Widget Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
@@ -92,6 +113,11 @@
 		E74B178DC212A229BC8565F4 /* TunnelManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TunnelManager.swift; sourceTree = "<group>"; };
 		F16CAECB3D91AC18F93D32C0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		FDE10D4B4A2BE32E0DD5E3D4 /* VKTurnProxyApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VKTurnProxyApp.swift; sourceTree = "<group>"; };
+		A10000000000000000000011 /* OrbitWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbitWidget.swift; sourceTree = "<group>"; };
+		A10000000000000000000012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		A10000000000000000000013 /* OrbitWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OrbitWidget.entitlements; sourceTree = "<group>"; };
+		A10000000000000000000014 /* OrbitWidget.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = OrbitWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000000000000000000002 /* AppIntents.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppIntents.framework; path = System/Library/Frameworks/AppIntents.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -108,6 +134,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A20000000000000000000001 /* AppIntents.framework in Frameworks */,
 				F32EA8BA9CCC4E95BD4DFA12 /* NetworkExtension.framework in Frameworks */,
 				0470680ADE2F45AF53C9277D /* WireGuardTURN.xcframework in Frameworks */,
 			);
@@ -127,9 +154,20 @@
 			path = PacketTunnel;
 			sourceTree = "<group>";
 		};
+		A10000000000000000000015 /* OrbitWidget */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000011 /* OrbitWidget.swift */,
+				A10000000000000000000012 /* Info.plist */,
+				A10000000000000000000013 /* OrbitWidget.entitlements */,
+			);
+			path = OrbitWidget;
+			sourceTree = "<group>";
+		};
 		150D6D20AA77CA102C2B0119 /* Products */ = {
 			isa = PBXGroup;
 			children = (
+				A10000000000000000000014 /* OrbitWidget.appex */,
 				E28ACD6367F3CDE026C71A36 /* PacketTunnel.appex */,
 				7342F754F29FF238732D4C8A /* VKTurnProxy.app */,
 			);
@@ -140,6 +178,7 @@
 			isa = PBXGroup;
 			children = (
 				05D165AC8B5B42686D871C6C /* PacketTunnel */,
+				A10000000000000000000015 /* OrbitWidget */,
 				9C68AA12FFBB168491B35540 /* VKTurnProxy */,
 				B6F1BD8B36C56C6FC2673195 /* Frameworks */,
 				150D6D20AA77CA102C2B0119 /* Products */,
@@ -178,6 +217,7 @@
 		B6F1BD8B36C56C6FC2673195 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				A20000000000000000000002 /* AppIntents.framework */,
 				605ED1D89D0F1886A8414767 /* NetworkExtension.framework */,
 				99E2AC40D13D6F8DD598752A /* WireGuardTURN.xcframework */,
 			);
@@ -195,11 +235,13 @@
 				B67F24B52097C82D38E1E6A8 /* Resources */,
 				FDD4D50B4A2B8A282D81AE78 /* Frameworks */,
 				2350F4F39BFDD430EFA37AAC /* Embed Foundation Extensions */,
+				A10000000000000000000021 /* Embed Widget Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 				0970FFC8ED62B8D5E5A59EEE /* PBXTargetDependency */,
+				A10000000000000000000034 /* PBXTargetDependency */,
 			);
 			name = VKTurnProxy;
 			packageProductDependencies = (
@@ -226,6 +268,24 @@
 			productReference = E28ACD6367F3CDE026C71A36 /* PacketTunnel.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		A10000000000000000000030 /* OrbitWidget */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000031 /* Build configuration list for PBXNativeTarget "OrbitWidget" */;
+			buildPhases = (
+				A10000000000000000000032 /* Sources */,
+				A10000000000000000000033 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OrbitWidget;
+			packageProductDependencies = (
+			);
+			productName = OrbitWidget;
+			productReference = A10000000000000000000014 /* OrbitWidget.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -240,6 +300,10 @@
 						ProvisioningStyle = Automatic;
 					};
 					DC014AC2B8038EB7433CDED3 = {
+						DevelopmentTeam = CDMQ33VFQC;
+						ProvisioningStyle = Automatic;
+					};
+					A10000000000000000000030 = {
 						DevelopmentTeam = CDMQ33VFQC;
 						ProvisioningStyle = Automatic;
 					};
@@ -259,6 +323,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
+				A10000000000000000000030 /* OrbitWidget */,
 				DC014AC2B8038EB7433CDED3 /* PacketTunnel */,
 				41C7426A4820CE681FCBDC8E /* VKTurnProxy */,
 			);
@@ -313,6 +378,21 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A10000000000000000000032 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000001 /* OrbitWidget.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A10000000000000000000033 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -321,6 +401,11 @@
 			target = DC014AC2B8038EB7433CDED3 /* PacketTunnel */;
 			targetProxy = DC1BB6D5C784F7552F468357 /* PBXContainerItemProxy */;
 		};
+		A10000000000000000000034 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A10000000000000000000030 /* OrbitWidget */;
+			targetProxy = A10000000000000000000020 /* PBXContainerItemProxy */;
+		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
@@ -328,7 +413,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 200;
+			CURRENT_PROJECT_VERSION = 220;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -344,7 +429,7 @@
 				OTHER_LDFLAGS = (
 					"-lresolv",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.vkturnproxy.app.tunnel;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lendic.orbit.tunnel;
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = PacketTunnel/BridgeHeader.h;
@@ -358,7 +443,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 200;
+			CURRENT_PROJECT_VERSION = 220;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -373,7 +458,7 @@
 				OTHER_LDFLAGS = (
 					"-lresolv",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.vkturnproxy.app;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lendic.orbit;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = VKTurnProxy/BridgeHeader.h;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -384,7 +469,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements;
-				CURRENT_PROJECT_VERSION = 200;
+				CURRENT_PROJECT_VERSION = 220;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -400,7 +485,7 @@
 				OTHER_LDFLAGS = (
 					"-lresolv",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.vkturnproxy.app.tunnel;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lendic.orbit.tunnel;
 				SDKROOT = iphoneos;
 				SKIP_INSTALL = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = PacketTunnel/BridgeHeader.h;
@@ -479,7 +564,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = VKTurnProxy/VKTurnProxy.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				CURRENT_PROJECT_VERSION = 200;
+				CURRENT_PROJECT_VERSION = 220;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(PROJECT_DIR)/../WireGuardBridge/build",
@@ -494,7 +579,7 @@
 				OTHER_LDFLAGS = (
 					"-lresolv",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.vkturnproxy.app;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lendic.orbit;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = VKTurnProxy/BridgeHeader.h;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -559,6 +644,42 @@
 			};
 			name = Release;
 		};
+		A10000000000000000000035 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = OrbitWidget/OrbitWidget.entitlements;
+				CURRENT_PROJECT_VERSION = 220;
+				INFOPLIST_FILE = OrbitWidget/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lendic.orbit.widget;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A10000000000000000000036 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = OrbitWidget/OrbitWidget.entitlements;
+				CURRENT_PROJECT_VERSION = 220;
+				INFOPLIST_FILE = OrbitWidget/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lendic.orbit.widget;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -588,6 +709,15 @@
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
+		};
+		A10000000000000000000031 /* Build configuration list for PBXNativeTarget "OrbitWidget" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000035 /* Debug */,
+				A10000000000000000000036 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
 	};

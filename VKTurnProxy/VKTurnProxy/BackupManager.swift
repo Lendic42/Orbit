@@ -35,15 +35,15 @@ enum BackupError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noContainer:
-            return "App Group container is unavailable. Check entitlements."
+            return "Недоступен контейнер App Group. Проверьте entitlements."
         case .writeFailed(let detail):
-            return "Failed to write file: \(detail)"
+            return "Не удалось записать файл: \(detail)"
         case .readFailed(let detail):
-            return "Failed to read file: \(detail)"
+            return "Не удалось прочитать файл: \(detail)"
         case .decodeFailed(let detail):
-            return "Backup file is invalid or corrupted: \(detail)"
+            return "Файл бэкапа повреждён или имеет неверный формат: \(detail)"
         case .versionMismatch(let v):
-            return "Backup file version \(v) is not supported by this build."
+            return "Версия файла бэкапа \(v) не поддерживается этой сборкой."
         }
     }
 }
@@ -99,6 +99,8 @@ enum BackupManager {
         let wrapSOn = (d.object(forKey: "useWrapS") as? Bool) ?? false
         let wrapSProfile = d.string(forKey: "obfProfile") ?? "rtpopus"
         let wrapSClientID = d.string(forKey: "clientID") ?? ""
+        let energySaver = (d.object(forKey: "energySaver") as? Bool) ?? true
+        let proxyAPNs = (d.object(forKey: "proxyAPNs") as? Bool) ?? false
         let turnServerOverride = d.string(forKey: "turnServerOverride")
         let vkAuth = (d.object(forKey: "VKAuth") as? Bool) ?? false
         let settings = AppSettings(
@@ -123,7 +125,9 @@ enum BackupManager {
             vkAuth: vkAuth,
             useWrapS: wrapSOn,
             obfProfile: wrapSProfile,
-            clientID: wrapSClientID
+            clientID: wrapSClientID,
+            energySaver: energySaver,
+            proxyAPNs: proxyAPNs
         )
 
         var turnPool: CredCacheFile? = nil
@@ -263,6 +267,8 @@ enum BackupManager {
         // (build 149) — same nil-preserves-default pattern.
         if let v = s.forceLegacyCaptcha { d.set(v, forKey: "forceLegacyCaptcha") }
         if let v = s.vkAuth { d.set(v, forKey: "VKAuth") }
+        if let v = s.energySaver { d.set(v, forKey: "energySaver") }
+        if let v = s.proxyAPNs { d.set(v, forKey: "proxyAPNs") }
 
         SharedLogger.shared.log("[AppDebug] Backup: applied settings (numConnections=\(s.numConnections), cooldown=\(s.credPoolCooldownSeconds)s, useDTLS=\(s.useDTLS), useWrap=\(s.useWrap ?? false), useSrtp=\(s.useSrtp ?? false), useUDP=\(s.useUDP ?? false))")
 
@@ -474,11 +480,13 @@ enum BackupManager {
         let dtlsPort = parts[1].trimmingCharacters(in: .whitespaces)
         // parts[2] = wgPort, parts[3] = localPeerPort — intentionally ignored.
         let password = parts[4]
-        // parts[5] may be a comma-separated list of VK hashes — take the first.
-        let firstHashRaw = parts[5]
-            .split(separator: ",", omittingEmptySubsequences: false)
-            .first.map(String.init) ?? ""
-        let firstHash = stripVkUrl(firstHashRaw)
+        // parts[5] may be a comma-separated list of VK hashes. Keep ALL of them
+        // (one per line): Android / WDTT uses multiple call links for relay
+        // diversity; if the first call dies, the next hash still works.
+        let hashTokens = parts.dropFirst(5).joined(separator: ":")
+            .split(separator: ",", omittingEmptySubsequences: true)
+            .map { stripVkUrl(String($0)) }
+            .filter { !$0.isEmpty }
 
         guard !ip.isEmpty, !dtlsPort.isEmpty, Int(dtlsPort) != nil else {
             throw BackupError.decodeFailed("wdtt:// link has an invalid IP or DTLS port")
@@ -486,20 +494,27 @@ enum BackupManager {
         guard !password.isEmpty else {
             throw BackupError.decodeFailed("wdtt:// link is missing the tunnel password")
         }
-        guard !firstHash.isEmpty else {
+        guard !hashTokens.isEmpty else {
             throw BackupError.decodeFailed("wdtt:// link is missing the VK hash")
         }
 
+        // Multiline: each hash is a separate call. Proxy tries them in order
+        // when GetVKCreds fails (dead call is the #1 "stuck on TURN+DTLS" cause).
+        let vkLink = hashTokens
+            .map { "https://vk.com/call/join/\($0)" }
+            .joined(separator: "\n")
+
+        // Android qWDTT sets workers=16 on wdtt:// import — use the same default.
         let settings = ConnectionSettings(
             privateKey: nil, peerPublicKey: nil, presharedKey: nil,
             tunnelAddress: nil, allowedIPs: nil,
-            vkLink: "https://vk.com/call/join/" + firstHash,
+            vkLink: vkLink,
             peerAddress: "\(ip):\(dtlsPort)",
             useDTLS: nil, useWrap: nil, wrapKeyHex: nil,
-            useSrtp: nil, useUDP: nil,
+            useSrtp: false, useUDP: false, // TCP to TURN; WRAP-A not SRTP
             useWrapA: true, wrapAPassword: password,
             turnServerOverride: nil,
-            dnsServers: nil, numConnections: nil
+            dnsServers: nil, numConnections: 16
         )
         return ConnectionLink(version: supportedConfigVersion, type: "connection", settings: settings)
     }

@@ -1,5 +1,7 @@
 # Build artifacts
 WireGuardBridge/build/
+dist/
+outputs/
 # Archive + export output (script-generated).
 build_output/
 # Bare-name Go binaries produced by `go build .` without -o.

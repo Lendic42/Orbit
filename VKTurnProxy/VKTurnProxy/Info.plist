@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>VK Turn Proxy</string>
+	<string>Orbit</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -24,11 +24,12 @@
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
 			<key>CFBundleURLName</key>
-			<string>com.vkturnproxy.app</string>
+			<string>com.lendic.orbit</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>vkturnproxy</string>
 				<string>wdtt</string>
+				<string>qwdtt</string>
 				<string>freeturn</string>
 			</array>
 		</dict>
@@ -37,6 +38,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>NSCameraUsageDescription</key>
+	<string>Камера нужна для импорта профилей WDTT и qWDTT по QR-коду.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

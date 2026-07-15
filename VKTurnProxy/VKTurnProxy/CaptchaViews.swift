@@ -32,7 +32,7 @@ struct CaptchaWebView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Solve Captcha")
+                Text("Решите капчу")
                     .font(.headline)
                 Spacer()
                 Button("Done") { onDismiss() }
@@ -65,9 +65,9 @@ struct CaptchaWebView: View {
                 if !pageHasContent {
                     VStack(spacing: 16) {
                         ProgressView().scaleEffect(1.3)
-                        Text("Loading captcha…")
+                        Text("Загрузка капчи…")
                             .font(.headline)
-                        Text("\(elapsedSec)s")
+                        Text("\(elapsedSec) с")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
                             .monospacedDigit()
@@ -655,4 +655,3 @@ struct CaptchaWKWebView: UIViewRepresentable {
         }
     }
 }
-

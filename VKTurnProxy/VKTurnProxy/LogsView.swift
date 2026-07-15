@@ -35,7 +35,7 @@ struct LogsView: View {
             Divider()
 
             HStack {
-                Toggle("Auto-scroll", isOn: $autoScroll)
+                Toggle("Автопрокрутка", isOn: $autoScroll)
                     .font(.caption)
                     .toggleStyle(.switch)
                     .fixedSize()
@@ -53,12 +53,12 @@ struct LogsView: View {
                     fallbackFetchedAt = .distantPast
                     logText = ""
                 }) {
-                    Label("Clear", systemImage: "trash")
+                    Label("Очистить", systemImage: "trash")
                         .font(.caption)
                 }
 
                 Button(action: { showShareSheet = true }) {
-                    Label("Share", systemImage: "square.and.arrow.up")
+                    Label("Поделиться", systemImage: "square.and.arrow.up")
                         .font(.caption)
                 }
             }
@@ -185,13 +185,14 @@ struct LogsView: View {
                     "Reason: \(reason)\n\n" +
                     combined
             }
+            let finalCombined = combined
 
             await MainActor.run {
-                fallbackText = combined
+                fallbackText = finalCombined
                 fallbackFetchedAt = Date()
                 fallbackInFlight = false
                 if usingOSLogFallback {
-                    logText = truncated(combined)
+                    logText = truncated(finalCombined)
                 }
             }
         }
@@ -261,4 +262,3 @@ struct ShareSheet: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
-

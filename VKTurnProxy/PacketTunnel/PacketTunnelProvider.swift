@@ -66,6 +66,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // is ignored and serverAddress becomes the only mechanism.
     private static let sharedDefaultsSuiteName = "group.com.vkturnproxy.app"
     private static let turnServerIPKey = "lastTurnServerIP"
+    private static let pendingProxyConfigName = "pending_proxy_config.json"
+
+    /// Fresh proxy_config staged by the main app into the App Group so we can
+    /// start without a saveToPreferences / NECP rebuild on every connect.
+    private static func loadPendingProxyConfig() -> String? {
+        guard let container = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: sharedDefaultsSuiteName
+        ) else { return nil }
+        let url = container.appendingPathComponent(pendingProxyConfigName)
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
 
     private func persistTurnServerIP(_ ip: String) {
         guard !ip.isEmpty else { return }
@@ -87,6 +98,45 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func persistAuthError(_ msg: String) {
         guard let shared = UserDefaults(suiteName: Self.sharedDefaultsSuiteName) else { return }
         shared.set(msg, forKey: Self.authErrorKey)
+    }
+
+    private func persistBootstrapError(_ msg: String) {
+        guard let shared = UserDefaults(suiteName: Self.sharedDefaultsSuiteName) else { return }
+        shared.set(msg, forKey: "bootstrap_error")
+        shared.set(msg, forKey: "bootstrap_progress")
+        logMsg("bootstrap_error persisted: \(msg)")
+    }
+
+    private func persistBootstrapProgress(_ msg: String) {
+        guard let shared = UserDefaults(suiteName: Self.sharedDefaultsSuiteName) else { return }
+        shared.set(msg, forKey: "bootstrap_progress")
+    }
+
+    private func readLastErrorFromStats(_ handle: Int32) -> String? {
+        guard let ptr = wgGetStats(handle) else { return nil }
+        let json = String(cString: ptr)
+        free(UnsafeMutableRawPointer(mutating: ptr))
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let le = obj["last_error"] as? String, !le.isEmpty else {
+            return nil
+        }
+        return le
+    }
+
+    private func describePeerHint() -> String {
+        guard let proto = protocolConfiguration as? NETunnelProviderProtocol else {
+            return "прокси-сервер"
+        }
+        // Prefer peer from proxy_config if present (TURN IP in serverAddress is
+        // the VK relay, not the VPS — less useful in the error string).
+        if let pending = Self.loadPendingProxyConfig(),
+           let data = pending.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let peer = obj["peer_addr"] as? String, !peer.isEmpty {
+            return peer
+        }
+        return proto.serverAddress ?? "прокси-сервер"
     }
 
     // Starts the background cookie-rejection watchdog (cookie mode only). Every
@@ -134,7 +184,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // wasn't obvious until grep'ing source vs running binary
         // behavior.
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
-        logMsg("startTunnel called (build \(build))")
+        let bid = Bundle.main.bundleIdentifier ?? "?"
+        // First thing — prove the extension process is alive to the main app
+        // (App Group). If the UI stays on "main: waiting extension bootstrap",
+        // this line never ran → iOS never launched the appex.
+        self.persistBootstrapProgress("extension: startTunnel entered build=\(build) id=\(bid)")
+        logMsg("startTunnel called (build \(build) bundle=\(bid) options=\(options?.keys.sorted().joined(separator: ",") ?? "nil"))")
         startPathMonitoring()
 
         // Set Go timezone BEFORE wgSetLogFilePath so the first Go log line
@@ -151,30 +206,82 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             logMsg("Go log file path set: \(path)")
         }
 
-        guard let config = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration else {
-            logMsg("ERROR: no provider configuration")
-            completionHandler(VPNError.noConfiguration)
-            return
+        // Merge config sources (priority high → low), matching Android's
+        // "params on start" model:
+        //   1. startTunnel(options:) from main app  ← freshest
+        //   2. App Group pending_proxy_config.json
+        //   3. providerConfiguration (preferences)
+        let prefs = (protocolConfiguration as? NETunnelProviderProtocol)?.providerConfiguration ?? [:]
+        let opts = options ?? [:]
+
+        func optString(_ key: String) -> String? {
+            if let s = opts[key] as? String, !s.isEmpty { return s }
+            if let s = opts[key] as? NSString { let t = s as String; return t.isEmpty ? nil : t }
+            return nil
+        }
+        func optBool(_ key: String) -> Bool? {
+            if let b = opts[key] as? Bool { return b }
+            if let n = opts[key] as? NSNumber { return n.boolValue }
+            return nil
         }
 
-        guard let wgConfig = config["wg_config"] as? String,
-              let proxyConfigJSON = config["proxy_config"] as? String else {
-            logMsg("ERROR: missing wg_config or proxy_config")
+        let wgConfig: String
+        if let o = optString("wg_config") {
+            wgConfig = o
+            logMsg("wg_config from startTunnel options")
+        } else if let s = prefs["wg_config"] as? String, !s.isEmpty {
+            wgConfig = s
+            logMsg("wg_config from providerConfiguration")
+        } else if let s = prefs["wg_config"] as? NSString {
+            wgConfig = s as String
+            logMsg("wg_config from providerConfiguration (NSString)")
+        } else {
+            logMsg("ERROR: missing wg_config (options + preferences empty)")
             completionHandler(VPNError.invalidConfiguration)
             return
         }
 
-        let tunnelAddress = config["tunnel_address"] as? String ?? "192.168.102.3/24"
-        let dnsServers = config["dns_servers"] as? String ?? "1.1.1.1"
-        let mtu = config["mtu"] as? String ?? "1280"
-        // WRAP-A (amurcanov interop): the server provisions WireGuard via
-        // GETCONF during bootstrap; when set, we fetch the minted config below
-        // (wgWaitWrapAProvision) and override wg_config + address/dns/mtu — the
-        // user entered none of those.
-        let isWrapA = (config["use_wrap_a"] as? Bool) ?? false
+        let proxyConfigJSON: String
+        if let o = optString("proxy_config") {
+            proxyConfigJSON = o
+            logMsg("proxy_config from startTunnel options (\(o.count) bytes)")
+        } else if let pending = Self.loadPendingProxyConfig(), !pending.isEmpty {
+            proxyConfigJSON = pending
+            logMsg("proxy_config from App Group pending file (\(pending.count) bytes)")
+        } else if let stored = prefs["proxy_config"] as? String, !stored.isEmpty {
+            proxyConfigJSON = stored
+            logMsg("proxy_config from providerConfiguration (\(stored.count) bytes)")
+        } else if let stored = prefs["proxy_config"] as? NSString {
+            proxyConfigJSON = stored as String
+            logMsg("proxy_config from providerConfiguration NSString")
+        } else {
+            logMsg("ERROR: missing proxy_config from all sources")
+            completionHandler(VPNError.invalidConfiguration)
+            return
+        }
 
-        logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu)")
-        logMsg("proxyConfig=\(proxyConfigJSON)")
+        let tunnelAddress = optString("tunnel_address")
+            ?? (prefs["tunnel_address"] as? String)
+            ?? "192.168.102.3/24"
+        let dnsServers = optString("dns_servers")
+            ?? (prefs["dns_servers"] as? String)
+            ?? "1.1.1.1"
+        let mtu = optString("mtu")
+            ?? (prefs["mtu"] as? String)
+            ?? "1280"
+        // WRAP-A (amurcanov / qWDTT): server provisions WireGuard via GETCONF.
+        let isWrapA = optBool("use_wrap_a")
+            ?? (prefs["use_wrap_a"] as? Bool)
+            ?? (prefs["use_wrap_a"] as? NSNumber)?.boolValue
+            ?? false
+        let proxyAPNs = optBool("proxy_apns")
+            ?? (prefs["proxy_apns"] as? Bool)
+            ?? (prefs["proxy_apns"] as? NSNumber)?.boolValue
+            ?? false
+
+        self.persistBootstrapProgress("extension: startTunnel config ok wrapA=\(isWrapA)")
+        logMsg("tunnelAddress=\(tunnelAddress) dns=\(dnsServers) mtu=\(mtu) wrapA=\(isWrapA) fullTunnel=true proxyAPNs=\(proxyAPNs)")
+        logMsg("proxyConfig=\(proxyConfigJSON.prefix(400))…")
 
         // ------------------------------------------------------------------
         // Deferred-setTunnelNetworkSettings bootstrap flow (Step 4 of the
@@ -218,8 +325,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // cookie is intentionally NOT in proxy_config (so it never persists in
         // the VPN providerConfiguration). With it set, GetVKCreds uses ONLY the
         // cookie path. If disabled, force it off (the process may be reused).
-        let useCookieAuth = (config["use_cookie_auth"] as? Bool) ?? false
-        let cookieLinks = (config["vk_cookie_links"] as? [String]) ?? []
+        let useCookieAuth = optBool("use_cookie_auth")
+            ?? (prefs["use_cookie_auth"] as? Bool)
+            ?? (prefs["use_cookie_auth"] as? NSNumber)?.boolValue
+            ?? false
+        let cookieLinks = (opts["vk_cookie_links"] as? [String])
+            ?? (prefs["vk_cookie_links"] as? [String])
+            ?? []
         let cookieLinksJSON = (try? String(data: JSONSerialization.data(withJSONObject: cookieLinks), encoding: .utf8)) ?? "[]"
         if useCookieAuth, let cookie = VKCookieStore.validCookieHeader() {
             cookie.withCString { cptr in
@@ -251,28 +363,43 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         self.tunnelHandle = handle
         logMsg("wgStartVKBootstrap OK, handle=\(handle)")
 
-        // Wait for bootstrap in the background so completionHandler isn't
-        // held for the entire (possibly captcha-solving) duration from the
-        // main thread. 120s matches turnbridge's budget and comfortably
-        // covers a manual captcha solve in the WebView.
+        // Wait for bootstrap off the main thread. 55s hard budget — longer
+        // values made the app look "forever stuck" on TURN+DTLS with no fail.
+        // Captcha (if needed) is solved pre-bootstrap in the main app.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            let ready = wgWaitBootstrapReady(handle, 120_000)
+            // Heartbeat into App Group so the main app can show progress even
+            // when get_stats IPC is slow / extension is mid-DTLS.
+            self.persistBootstrapProgress("extension: bootstrap started")
+            let ready = wgWaitBootstrapReady(handle, 55_000)
             switch ready {
             case 1:
                 self.logMsg("wgWaitBootstrapReady: ready")
+                UserDefaults(suiteName: Self.sharedDefaultsSuiteName)?
+                    .removeObject(forKey: "bootstrap_error")
+                self.persistBootstrapProgress("extension: ready")
                 if useCookieAuth {
                     self.startAuthErrorWatchdog()
                 }
             case 0:
-                self.logMsg("wgWaitBootstrapReady: timeout after 120s — aborting")
+                self.logMsg("wgWaitBootstrapReady: timeout after 55s — aborting")
+                var detail = "Таймаут TURN/DTLS (55с). Сервер \(self.describePeerHint()) не отвечает, неверный режим или мёртвый VK‑звонок."
+                if let le = self.readLastErrorFromStats(handle), !le.isEmpty {
+                    detail = le
+                }
+                self.persistBootstrapError(detail)
                 wgTurnOff(handle)
                 self.tunnelHandle = -1
                 completionHandler(VPNError.bootstrapTimeout)
                 return
             default:
                 self.logMsg("wgWaitBootstrapReady: failed with code \(ready) — aborting")
+                var detail = "Bootstrap failed (code \(ready))"
+                if let le = self.readLastErrorFromStats(handle), !le.isEmpty {
+                    detail = le
+                }
+                self.persistBootstrapError(detail)
                 wgTurnOff(handle)
                 self.tunnelHandle = -1
                 completionHandler(VPNError.backendFailed(code: ready))
@@ -342,7 +469,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 address: effAddress,
                 dns: effDNS,
                 mtu: effMTU,
-                tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP
+                tunnelRemoteAddress: turnIP.isEmpty ? "10.0.0.1" : turnIP,
+                allowedIPs: ["0.0.0.0/0", "::/0"]
             )
 
             DispatchQueue.main.async {
@@ -392,7 +520,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        if msg == "get_stats" {
+        if msg == "ping" {
+            // Main-app liveness probe while stuck on "waiting extension bootstrap".
+            completionHandler?("pong".data(using: .utf8))
+            return
+        } else if msg == "get_stats" {
             guard tunnelHandle >= 0 else {
                 completionHandler?(nil)
                 return
@@ -741,6 +873,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         dns: String,
         mtu: String,
         tunnelRemoteAddress: String,
+        allowedIPs: [String],
         includeDefaultRoute: Bool = true
     ) -> NEPacketTunnelNetworkSettings {
         let parts = address.split(separator: "/")
@@ -762,15 +895,35 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // attached. With includeAllNetworks=true on the VPN profile, an
         // empty includedRoutes here keeps the tunnel routing-inert — iOS
         // doesn't have a default route to enforce yet.
-        ipv4.includedRoutes = includeDefaultRoute ? [NEIPv4Route.default()] : []
+        let cidrs = includeDefaultRoute ? allowedIPs : []
+        let ipv4Routes = cidrs.compactMap { cidr -> NEIPv4Route? in
+            let parts = cidr.split(separator: "/", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let prefix = Int(parts[1]),
+                  prefix >= 0, prefix <= 32, IPv4Address(parts[0]) != nil else { return nil }
+            return NEIPv4Route(destinationAddress: parts[0], subnetMask: prefixToSubnet(prefix))
+        }
+        ipv4.includedRoutes = ipv4Routes
+        ipv4.excludedRoutes = []
         // No excludedRoutes: with includeAllNetworks=true on the VPN profile,
         // iOS ignores excludedRoutes entirely (Apple docs). The only
         // always-excluded destination is the serverAddress (see above), plus
         // Apple's built-in list (DHCP, captive networks, cellular services
         // when flagged). Removing excludedRoutes here keeps the intent
         // explicit.
-        ipv4.excludedRoutes = []
         settings.ipv4Settings = ipv4
+
+        let ipv6Routes = cidrs.compactMap { cidr -> NEIPv6Route? in
+            let parts = cidr.split(separator: "/", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let prefix = Int(parts[1]),
+                  prefix >= 0, prefix <= 128, IPv6Address(parts[0]) != nil else { return nil }
+            return NEIPv6Route(destinationAddress: parts[0], networkPrefixLength: NSNumber(value: prefix))
+        }
+        if !ipv6Routes.isEmpty {
+            let ipv6 = NEIPv6Settings(addresses: ["::"], networkPrefixLengths: [NSNumber(value: 0)])
+            ipv6.includedRoutes = ipv6Routes
+            ipv6.excludedRoutes = []
+            settings.ipv6Settings = ipv6
+        }
 
         if !dns.isEmpty {
             let dnsAddresses = dns.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) }
@@ -824,7 +977,7 @@ enum VPNError: Error, LocalizedError {
         case .invalidConfiguration: return "Invalid or missing configuration fields"
         case .noTunDevice: return "Could not find TUN file descriptor"
         case .backendFailed(let code): return "WireGuard backend failed with code \(code)"
-        case .bootstrapTimeout: return "VK bootstrap did not complete within 120s (captcha may be required)"
+        case .bootstrapTimeout: return "VK bootstrap did not complete within 55s (TURN/DTLS hung or extension stuck)"
         }
     }
 }

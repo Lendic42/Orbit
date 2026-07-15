@@ -1,7 +1,20 @@
 import Foundation
 import Network
-import NetworkExtension
+@preconcurrency import NetworkExtension
 import UIKit
+
+private final class OneShotGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
+}
 
 // MARK: - Tunnel Statistics
 
@@ -50,6 +63,8 @@ struct TunnelStats: Codable {
     // Non-empty when cookie (VKAuth) auth hit an unrecoverable rejection. The
     // main app reads it during stats polling → shows a message + stops the tunnel.
     var authError: String?
+    /// Most recent TURN/DTLS/GETCONF failure from the extension (during connect).
+    var lastError: String?
 
     enum CodingKeys: String, CodingKey {
         case txBytes = "tx_bytes"
@@ -67,6 +82,7 @@ struct TunnelStats: Codable {
         case captchaImageURL = "captcha_image_url"
         case captchaSID = "captcha_sid"
         case authError = "auth_error"
+        case lastError = "last_error"
     }
 }
 
@@ -83,6 +99,11 @@ class TunnelManager: ObservableObject {
     private var statusObserver: NSObjectProtocol?
     private var foregroundObserver: NSObjectProtocol?
     private var statsTimer: Timer?
+    /// Cancels a hung connect (status stuck on .connecting forever — common
+    /// when the Packet Tunnel extension never launches under sideload, or
+    /// Go bootstrap loops without ever calling completionHandler).
+    private var connectWatchdogTask: Task<Void, Never>?
+    private var connectWatchdogStartedAt: Date?
 
     // For rate calculation
     private var prevTx: Int64 = 0
@@ -115,6 +136,9 @@ class TunnelManager: ObservableObject {
     // the "Connecting" state — without it, the user sees no visual
     // change for the ~5-15 seconds the probe takes.
     @Published var preBootstrapInProgress = false
+    /// Human-readable connect stage for the home screen (RU). Cleared when
+    /// pre-bootstrap ends or tunnel reaches a terminal status.
+    @Published var connectPhase: String = ""
     // Set true when JS detector in the WebView reports the loaded page is
     // "Attempt limit reached" (no interactive element, error text visible).
     // UI renders an overlay with a progress indicator while this is true.
@@ -180,7 +204,14 @@ class TunnelManager: ObservableObject {
         }
         errorMessage = nil
         preBootstrapInProgress = true
-        defer { preBootstrapInProgress = false }
+        connectPhase = "Запуск…"
+        defer {
+            preBootstrapInProgress = false
+            // Keep phase briefly if still connecting via NEVPN; clear on failure.
+            if status != .connecting && status != .connected && status != .reasserting {
+                connectPhase = ""
+            }
+        }
 
         // Set Go timezone BEFORE wgSetLogFilePath so the logger's first
         // line ("wgSetLogFilePath: ...") gets a local-time timestamp.
@@ -212,19 +243,9 @@ class TunnelManager: ObservableObject {
             // "hex string does not fit the slice" from wireguard-go.
             let wgConfig = try buildUAPIConfig(config: config)
 
-            // Resolve VK API hostnames here, in the main-app process — the
-            // extension can't do this reliably itself before
-            // setTunnelNetworkSettings (and we defer that until after
-            // bootstrap). Run on a background queue so the UI thread isn't
-            // blocked by CFHost (~30-100 ms per host on a healthy network).
-            let vkHostIPs = await Task.detached(priority: .userInitiated) { [self] in
-                self.resolveVKHosts()
-            }.value
-            if !vkHostIPs.isEmpty {
-                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: pre-resolved VK hosts: \(vkHostIPs)")
-            } else {
-                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: WARNING — pre-resolved VK hosts list is empty")
-            }
+            // VK host resolution is only needed when we must hit VK API
+            // (probe / no cache). Cache hit → skip CFHost entirely (~100–400ms).
+            var vkHostIPs: [String: [String]] = [:]
 
             // ----------------------------------------------------------------
             // Pre-bootstrap captcha probe.
@@ -250,15 +271,37 @@ class TunnelManager: ObservableObject {
             // extension to seed credPool slot 0, so the first conn comes up
             // immediately without another VK round-trip.
             // ----------------------------------------------------------------
-            let linkID = URL(string: config.vkLink)?.lastPathComponent ?? ""
-            let hostIPsJSONStr: String = {
-                if !vkHostIPs.isEmpty,
-                   let data = try? JSONSerialization.data(withJSONObject: vkHostIPs),
-                   let str = String(data: data, encoding: .utf8) {
-                    return str
+            // All call tokens from multiline vkLink (wdtt can carry 2–4 hashes).
+            let allLinkIDs: [String] = {
+                var ids: [String] = []
+                var seen = Set<String>()
+                for line in config.vkLink.split(whereSeparator: { $0.isNewline || $0 == "," }) {
+                    let t = line.trimmingCharacters(in: .whitespaces)
+                    guard !t.isEmpty else { continue }
+                    let token: String
+                    if let u = URL(string: t), let last = u.pathComponents.last, last != "/" {
+                        token = last
+                    } else if t.contains("join/") {
+                        token = t.components(separatedBy: "join/").last?
+                            .components(separatedBy: CharacterSet(charactersIn: "/?# \t")).first ?? t
+                    } else {
+                        token = t
+                    }
+                    let clean = token.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    guard !clean.isEmpty, !seen.contains(clean) else { continue }
+                    seen.insert(clean)
+                    ids.append(clean)
                 }
-                return ""
+                return ids
             }()
+            var linkIDIndex = 0
+            var linkID = allLinkIDs.first ?? (URL(string: config.vkLink)?.lastPathComponent ?? "")
+            func hostIPsJSON(_ map: [String: [String]]) -> String {
+                guard !map.isEmpty,
+                      let data = try? JSONSerialization.data(withJSONObject: map),
+                      let str = String(data: data, encoding: .utf8) else { return "" }
+                return str
+            }
 
             var savedSID = ""
             var savedKey = ""
@@ -288,9 +331,11 @@ class TunnelManager: ObservableObject {
                 // Go runtime, then do ONE cookie-probe to validate it + seed the
                 // first TURN cred. NO anonymous fallback (matches the Go side).
                 UserDefaults(suiteName: "group.com.vkturnproxy.app")?.removeObject(forKey: "vkauth_error")
+                connectPhase = "Проверка сессии VK…"
 
                 if !VKCookieStore.isValid() {
                     SharedLogger.shared.log("[AppDebug] VKAuth: no valid cookie — presenting login WebView")
+                    connectPhase = "Вход в VK…"
                     switch await awaitVKLogin() {
                     case .harvested(let header, let expiry):
                         VKCookieStore.save(cookieHeader: header, expiry: expiry)
@@ -312,7 +357,12 @@ class TunnelManager: ObservableObject {
                     }
                 }
 
-                switch await probeVKCreds(linkID: linkID, vkHostIPsJSON: hostIPsJSONStr) {
+                connectPhase = "Запрос кредов VK…"
+                vkHostIPs = await Task.detached(priority: .userInitiated) { [self] in
+                    self.resolveVKHosts()
+                }.value
+
+                switch await probeVKCreds(linkID: linkID, vkHostIPsJSON: hostIPsJSON(vkHostIPs)) {
                 case .ok(let addr, let user, let pass):
                     if let h = config.turnServerOverride, !h.isEmpty,
                        let pt = config.turnPortOverride, !pt.isEmpty {
@@ -324,7 +374,7 @@ class TunnelManager: ObservableObject {
                     }
                 case .cookieRejected:
                     SharedLogger.shared.log("[AppDebug] VKAuth: cookie rejected by VK — aborting")
-                    errorMessage = "VK перестал принимать сохранённую сессию. Войдите заново (Настройки → Log in to VK)."
+                    errorMessage = "VK перестал принимать сохранённую сессию. Войдите заново в настройках."
                     return
                 case .captcha:
                     SharedLogger.shared.log("[AppDebug] VKAuth: unexpected captcha in cookie mode — aborting")
@@ -332,7 +382,7 @@ class TunnelManager: ObservableObject {
                     return
                 case .callUnavailable(let code, let msg):
                     SharedLogger.shared.log("[AppDebug] VKAuth: call unavailable (code=\(code)): \(msg)")
-                    errorMessage = "VK returns error: \(msg)"
+                    errorMessage = "VK вернул ошибку: \(msg)"
                     return
                 case .error(let msg):
                     SharedLogger.shared.log("[AppDebug] VKAuth: probe error: \(msg)")
@@ -358,16 +408,28 @@ class TunnelManager: ObservableObject {
             // first successful fetch.
             if let cached = CredCache.loadValidCred() {
                 seededTURN = cached
+                connectPhase = "Кэш TURN — быстрый старт"
                 SharedLogger.shared.log("[AppDebug] pre-bootstrap: using cached TURN cred from disk (addr=\(cached.address)), skipping captcha probe")
             } else {
                 SharedLogger.shared.log("[AppDebug] pre-bootstrap: no usable cached cred (no file or all entries expired), starting captcha probe")
+                connectPhase = "Запрос кредов VK…"
+                // Resolve VK hosts only when we actually need a VK API round-trip.
+                vkHostIPs = await Task.detached(priority: .userInitiated) { [self] in
+                    self.resolveVKHosts()
+                }.value
+                if !vkHostIPs.isEmpty {
+                    SharedLogger.shared.log("[AppDebug] TunnelManager.connect: pre-resolved VK hosts: \(vkHostIPs)")
+                } else {
+                    SharedLogger.shared.log("[AppDebug] TunnelManager.connect: WARNING — pre-resolved VK hosts list is empty")
+                }
             }
 
             probeLoop: for attempt in 1...5 where seededTURN == nil {
+                connectPhase = "Креды VK · попытка \(attempt)/5"
                 SharedLogger.shared.log("[AppDebug] pre-bootstrap probe attempt \(attempt)/5")
                 let result = await probeVKCreds(
                     linkID: linkID,
-                    vkHostIPsJSON: hostIPsJSONStr,
+                    vkHostIPsJSON: hostIPsJSON(vkHostIPs),
                     savedSID: savedSID,
                     savedKey: savedKey,
                     savedToken1: savedToken1,
@@ -438,11 +500,31 @@ class TunnelManager: ObservableObject {
                     errorMessage = "Не удалось подключиться: \(msg)"
                     return
                 case .callUnavailable(let code, let msg):
-                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: call unavailable (code=\(code)): \(msg)")
-                    errorMessage = "VK returns error: \(msg)"
+                    SharedLogger.shared.log("[AppDebug] pre-bootstrap: call unavailable (code=\(code)): \(msg) hash=\(linkID.prefix(12))…")
+                    // Try next VK call hash from the wdtt multi-hash list.
+                    if linkIDIndex + 1 < allLinkIDs.count {
+                        linkIDIndex += 1
+                        linkID = allLinkIDs[linkIDIndex]
+                        SharedLogger.shared.log("[AppDebug] pre-bootstrap: trying fallback VK hash \(linkIDIndex+1)/\(allLinkIDs.count)")
+                        connectPhase = "Другой VK‑звонок (\(linkIDIndex+1)/\(allLinkIDs.count))…"
+                        savedSID = ""; savedKey = ""; savedToken1 = ""; savedClientID = ""
+                        savedTs = 0; savedAttempt = 0
+                        continue probeLoop
+                    }
+                    errorMessage = "VK‑звонок недоступен: \(msg). Создайте новый звонок или обновите ссылку."
                     return
                 case .error(let msg):
                     SharedLogger.shared.log("[AppDebug] pre-bootstrap: error: \(msg)")
+                    // Soft fallback to next hash on generic errors too (except
+                    // rate-limit which is already handled above).
+                    if linkIDIndex + 1 < allLinkIDs.count,
+                       !msg.localizedCaseInsensitiveContains("rate") {
+                        linkIDIndex += 1
+                        linkID = allLinkIDs[linkIDIndex]
+                        SharedLogger.shared.log("[AppDebug] pre-bootstrap: error on hash, trying fallback \(linkIDIndex+1)/\(allLinkIDs.count)")
+                        connectPhase = "Другой VK‑звонок (\(linkIDIndex+1)/\(allLinkIDs.count))…"
+                        continue probeLoop
+                    }
                     errorMessage = "Не удалось подключиться: \(msg)"
                     return
                 }
@@ -458,6 +540,13 @@ class TunnelManager: ObservableObject {
             // Build proxy config JSON, seeding credPool slot 0 with the
             // pre-fetched TURN creds.
             let proxyConfig = buildProxyConfig(config: config, vkHostIPs: vkHostIPs, seededTURN: seeded)
+            // Always stage the latest proxy_config in the App Group so the
+            // extension can pick it up without a saveToPreferences() round-trip
+            // (NECP rebuild). See PacketTunnelProvider.startTunnel.
+            let pendingOK = Self.writePendingProxyConfig(proxyConfig)
+            if !pendingOK {
+                SharedLogger.shared.log("[AppDebug] pending proxy write failed — will force VPN profile save")
+            }
 
             // Pick serverAddress. iOS always excludes serverAddress from the
             // tunnel per Apple's documented rule. We set it to the TURN IP we
@@ -505,10 +594,7 @@ class TunnelManager: ObservableObject {
             }
 
             // Set provider configuration
-            let proto = NETunnelProviderProtocol()
-            proto.providerBundleIdentifier = "com.vkturnproxy.app.tunnel"
-            proto.serverAddress = serverAddress
-            proto.providerConfiguration = [
+            let providerConfiguration: [String: Any] = [
                 "wg_config": wgConfig,
                 "proxy_config": proxyConfig,
                 "tunnel_address": config.tunnelAddress,
@@ -524,77 +610,332 @@ class TunnelManager: ObservableObject {
                 "use_cookie_auth": config.useCookieAuth,
                 // VKAuth call links (cookie mode): the pool spreads conns across
                 // each call's 2 TURN relays. Not a secret — just call link IDs.
-                "vk_cookie_links": config.cookieLinks
+                "vk_cookie_links": config.cookieLinks,
+                // Controls only Apple Push Notification service routing.
+                // The VPN itself remains a full tunnel in both states.
+                "proxy_apns": config.proxyAPNs
             ]
 
-            // Full-tunnel mode (Step 4 of the APNs-through-tunnel refactor).
-            // includeAllNetworks=true is the ONLY documented mechanism that
-            // pulls APNs (Apple Push Notification Service) traffic into the
-            // VPN on iOS — which is the goal of this whole refactor: pushes
-            // keep arriving when the device is on Wi-Fi going through the
-            // tunnel.
+            // ─── startVPNTunnel path (learned from Android WDTT + iOS NE pitfalls) ───
+            // Android order: Go TURN/DTLS first → then VpnService/WireGuard.
+            // iOS must start PacketTunnel to run Go; we still bootstrap BEFORE
+            // setTunnelNetworkSettings (Android-like: transport before routes).
             //
-            // Trade-offs we accept:
-            //  - excludedRoutes become inert (Apple ignores them). So the
-            //    only always-excluded destinations are: serverAddress
-            //    (set to the TURN relay IP above, see Step 3), Apple's
-            //    built-in always-excluded list (DHCP, captive networks,
-            //    cellular-services-direct…), and — iOS 16.4+ — whatever
-            //    we gate with the flags below.
-            //  - excludeLocalNetworks=true keeps LAN reachable even with
-            //    the full tunnel up (printers, AirPlay, etc.).
-            //  - excludeAPNs=false / excludeCellularServices=false
-            //    (both iOS 16.4+) override Apple's default where these
-            //    system-service categories bypass the tunnel — we want
-            //    them IN the tunnel so the user on Wi-Fi keeps receiving
-            //    pushes via our VPS.
+            // What matters here on device:
+            //  1. Stale NETunnelProviderManager after save — must re-load from
+            //     loadAllFromPreferences() before startVPNTunnel (Apple).
+            //  2. Config only in App Group — if group unavailable, extension
+            //     gets empty config. Pass proxy_config via startTunnel options.
             //
-            // Saving a profile whose includeAllNetworks changed re-prompts
-            // iOS for VPN permission on the next connect. This is a
-            // one-time UX cost for existing users.
-            proto.includeAllNetworks = true
+            // includeAllNetworks must be true for NEVPNProtocol.excludeAPNs to
+            // have its documented effect. Both switch states still use the
+            // same full VPN; only APNs is included or excluded.
+            let includeAll = true
+
+            // Bundle ID of the embedded PacketTunnel.appex — MUST match after
+            // Sideloadly/AltStore re-sign. Hardcoding com.lendic.orbit.tunnel
+            // is a classic "waiting extension bootstrap forever" bug when the
+            // tool renames the appex to <team>.<app>.tunnel but the protocol
+            // still points at the old id (extension never launches).
+            let tunnelBundleID = Self.embeddedTunnelProviderBundleID()
+            SharedLogger.shared.log("[AppDebug] TunnelManager.connect: tunnel provider bundle id = \(tunnelBundleID)")
+
+            let proto = NETunnelProviderProtocol()
+            proto.providerBundleIdentifier = tunnelBundleID
+            // For WRAP-A / SRTP, serverAddress is the VPS peer (not VK TURN).
+            // Using peer host keeps Apple's always-excluded list useful without
+            // tying to a single TURN relay IP.
+            let peerHost = config.peerAddress.split(separator: ":").first.map(String.init) ?? serverAddress
+            proto.serverAddress = peerHost.isEmpty ? serverAddress : peerHost
+            proto.providerConfiguration = providerConfiguration
+            proto.includeAllNetworks = includeAll
             proto.excludeLocalNetworks = true
             if #available(iOS 16.4, *) {
-                proto.excludeAPNs = false
-                proto.excludeCellularServices = false
+                proto.excludeAPNs = !config.proxyAPNs
+                // Keep Apple's other cellular services outside Orbit in both
+                // states so this switch changes APNs and nothing else.
+                proto.excludeCellularServices = true
             }
 
+            connectPhase = "Запуск VPN…"
+            UserDefaults(suiteName: "group.com.vkturnproxy.app")?
+                .removeObject(forKey: "bootstrap_error")
+            UserDefaults(suiteName: "group.com.vkturnproxy.app")?
+                .set("main: preparing VPN profile (\(tunnelBundleID))", forKey: "bootstrap_progress")
+
+            // Always save profile (simple + reliable). Skip-save was racing
+            // with stale managers and empty extension config on sideload.
             manager.protocolConfiguration = proto
-            manager.localizedDescription = "VK TURN Proxy"
+            manager.localizedDescription = "Orbit"
             manager.isEnabled = true
-
+            SharedLogger.shared.log("[AppDebug] TunnelManager.connect: saveToPreferences (fullTunnel=\(includeAll), proxyAPNs=\(config.proxyAPNs), pendingOK=\(pendingOK), provider=\(tunnelBundleID))")
             try await manager.saveToPreferences()
-            try await manager.loadFromPreferences()
 
-            // NECP settle delay before startVPNTunnel.
-            //
-            // Empirically observed (vpn YESGLITCH 2026-04-30 17:32:48):
-            // saveToPreferences() with includeAllNetworks=true triggers iOS
-            // NECP rule rebuild that briefly nulls all primary interfaces
-            // (en0, pdp_ip0) for ~370 ms. If startVPNTunnel() races into
-            // PreparingNetwork during that window, iOS aborts the session
-            // with stop reason 4 (NEUnrecoverableNetworkChange / "No
-            // network available"). The first extension instance dies, iOS
-            // auto-relaunches a second one ~800 ms later — visible as the
-            // cosmetic "preparing → connecting → connected → disconnecting
-            // → disconnected → connected" UI glitch.
-            //
-            // 700 ms covers the empirical 370 ms blackout with margin and
-            // is unnoticeable on top of the multi-second pre-bootstrap
-            // captcha flow that already runs before connect().
-            //
-            // TEMP for diagnostics — do not commit until verified across
-            // a handful of connect/disconnect cycles.
-            try await Task.sleep(nanoseconds: 700_000_000)
+            // Re-fetch manager from system preferences — required after save.
+            // Using the pre-save object for startVPNTunnel is a known hang source.
+            let managers = try await NETunnelProviderManager.loadAllFromPreferences()
+            guard let live = managers.first else {
+                throw NSError(domain: "Orbit", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "VPN-профиль не найден после save. Проверьте Signing / Network Extension."
+                ])
+            }
+            self.manager = live
+            observeStatus(live)
 
-            try manager.connection.startVPNTunnel()
+            if !live.isEnabled {
+                live.isEnabled = true
+                try await live.saveToPreferences()
+                try await live.loadFromPreferences()
+            }
+
+            // If a previous attempt left us mid-connecting, stop first.
+            let st = live.connection.status
+            if st == .connected || st == .connecting || st == .reasserting {
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: stopping prior session (status=\(st.rawValue))")
+                live.connection.stopVPNTunnel()
+                // Brief wait for teardown so startVPNTunnel doesn't no-op / hang.
+                for _ in 0..<20 {
+                    if live.connection.status == .disconnected || live.connection.status == .invalid {
+                        break
+                    }
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
+
+            // Briefly let iOS finish rebuilding NECP for the saved profile.
+            try await Task.sleep(nanoseconds: 350_000_000)
+
+            connectPhase = "startVPNTunnel…"
+            UserDefaults(suiteName: "group.com.vkturnproxy.app")?
+                .set("main: calling startVPNTunnel", forKey: "bootstrap_progress")
+
+            // Hand fresh config to the extension via options (Android-like:
+            // params on start, not only from stale preferences / App Group).
+            // Values must be NSObject-compatible.
+            var startOpts: [String: NSObject] = [
+                "proxy_config": proxyConfig as NSString,
+                "wg_config": wgConfig as NSString,
+                "tunnel_address": config.tunnelAddress as NSString,
+                "dns_servers": config.dnsServers as NSString,
+                "mtu": config.mtu as NSString,
+                "use_wrap_a": NSNumber(value: config.useWrapA),
+                "use_cookie_auth": NSNumber(value: config.useCookieAuth),
+                "proxy_apns": NSNumber(value: config.proxyAPNs),
+            ]
+            if !config.cookieLinks.isEmpty {
+                startOpts["vk_cookie_links"] = config.cookieLinks as NSArray
+            }
+
+            // startVPNTunnel itself should return quickly; if the system
+            // blocks (bad provisioning), watchdog still aborts the UI.
+            do {
+                try live.connection.startVPNTunnel(options: startOpts)
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: startVPNTunnel returned OK")
+            } catch {
+                SharedLogger.shared.log("[AppDebug] TunnelManager.connect: startVPNTunnel threw: \(error.localizedDescription)")
+                throw NSError(domain: "Orbit", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "startVPNTunnel: \(error.localizedDescription). Часто: нет entitlement Network Extension / Packet Tunnel, или профиль VPN не разрешён в Настройках iOS."
+                ])
+            }
+
+            connectPhase = "TURN + DTLS… 0с"
+            UserDefaults(suiteName: "group.com.vkturnproxy.app")?
+                .set("main: waiting extension bootstrap", forKey: "bootstrap_progress")
+            startConnectWatchdog()
+            startStatsPolling(reset: false)
         } catch {
             errorMessage = error.localizedDescription
+            connectPhase = ""
+            stopConnectWatchdog()
         }
     }
 
+    /// App Group path used to hand the extension a fresh proxy_config
+    /// (belt-and-suspenders alongside startTunnel options).
+    private static let pendingProxyConfigName = "pending_proxy_config.json"
+
+    /// Reads the real Packet Tunnel extension bundle id from the embedded
+    /// .appex. After Sideloadly/AltStore re-sign this often becomes
+    /// something other than com.lendic.orbit.tunnel.
+    static func embeddedTunnelProviderBundleID() -> String {
+        let fallback = "com.lendic.orbit.tunnel"
+        guard let plugins = Bundle.main.builtInPlugInsURL else {
+            SharedLogger.shared.log("[AppDebug] embeddedTunnelProviderBundleID: no PlugIns URL, fallback \(fallback)")
+            return fallback
+        }
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: plugins,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return fallback
+        }
+        for url in items where url.pathExtension == "appex" {
+            if let b = Bundle(url: url), let id = b.bundleIdentifier, !id.isEmpty {
+                SharedLogger.shared.log("[AppDebug] embeddedTunnelProviderBundleID: found \(id) at \(url.lastPathComponent)")
+                return id
+            }
+            // Fallback: read Info.plist without loading the bundle (more
+            // reliable if the appex is not yet code-valid on disk).
+            let plist = url.appendingPathComponent("Info.plist")
+            if let dict = NSDictionary(contentsOf: plist) as? [String: Any],
+               let id = dict["CFBundleIdentifier"] as? String, !id.isEmpty {
+                SharedLogger.shared.log("[AppDebug] embeddedTunnelProviderBundleID: plist \(id)")
+                return id
+            }
+        }
+        SharedLogger.shared.log("[AppDebug] embeddedTunnelProviderBundleID: no appex found, fallback \(fallback)")
+        return fallback
+    }
+
+    @discardableResult
+    private static func writePendingProxyConfig(_ json: String) -> Bool {
+        guard let container = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: "group.com.vkturnproxy.app"
+        ) else {
+            SharedLogger.shared.log("[AppDebug] writePendingProxyConfig: no App Group container")
+            return false
+        }
+        let url = container.appendingPathComponent(pendingProxyConfigName)
+        do {
+            try json.write(to: url, atomically: true, encoding: .utf8)
+            SharedLogger.shared.log("[AppDebug] writePendingProxyConfig: wrote \(json.count) bytes")
+            return true
+        } catch {
+            SharedLogger.shared.log("[AppDebug] writePendingProxyConfig failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+
     func disconnect() {
+        stopConnectWatchdog()
         manager?.connection.stopVPNTunnel()
+    }
+
+    /// Hard fail if we never reach .connected. Without this the UI can show
+    /// "TURN + DTLS…" indefinitely (extension not loading / bootstrap hang).
+    private func startConnectWatchdog() {
+        stopConnectWatchdog()
+        let started = Date()
+        connectWatchdogStartedAt = started
+        // 45s cap. Extension normally writes "extension: …" within 1–3s of
+        // startTunnel. If progress stays on "main: waiting extension…" for
+        // 12s → extension never launched (sideload / NE entitlement).
+        let limitSec = 45
+        let extensionGraceSec = 12
+        connectWatchdogTask = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            var sawExtension = false
+            for elapsed in 1...limitSec {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+
+                if self.status == .connected {
+                    self.stopConnectWatchdog()
+                    return
+                }
+                if self.status == .disconnected || self.status == .invalid {
+                    if self.errorMessage == nil,
+                       let shared = UserDefaults(suiteName: "group.com.vkturnproxy.app"),
+                       let be = shared.string(forKey: "bootstrap_error"), !be.isEmpty {
+                        self.errorMessage = be
+                        shared.removeObject(forKey: "bootstrap_error")
+                    }
+                    self.connectPhase = ""
+                    self.stopConnectWatchdog()
+                    return
+                }
+
+                let prog = UserDefaults(suiteName: "group.com.vkturnproxy.app")?
+                    .string(forKey: "bootstrap_progress") ?? ""
+                if prog.hasPrefix("extension:") {
+                    sawExtension = true
+                }
+
+                // Early abort: startVPNTunnel returned but extension never
+                // entered startTunnel (wrong providerBundleIdentifier after
+                // re-sign, missing packet-tunnel entitlement, unsigned appex).
+                if !sawExtension && elapsed >= extensionGraceSec
+                    && (prog.isEmpty || prog.hasPrefix("main:")) {
+                    let provider = Self.embeddedTunnelProviderBundleID()
+                    let msg =
+                        "Packet Tunnel extension не запустился (\(elapsed)с). " +
+                        "provider=\(provider). На сайдлоаде: 1) подпиши app+appex одним Apple ID, " +
+                        "2) не снимай Network Extension / packet-tunnel, " +
+                        "3) бесплатный Apple ID часто НЕ умеет VPN-extension — нужен paid dev или TrollStore."
+                    SharedLogger.shared.log("[AppDebug] connect watchdog: extension silent — \(msg)")
+                    self.errorMessage = msg
+                    self.connectPhase = ""
+                    self.manager?.connection.stopVPNTunnel()
+                    self.stopConnectWatchdog()
+                    return
+                }
+
+                // Probe extension via IPC (works only if process is up).
+                if elapsed == 5 || elapsed == 15 {
+                    self.probeExtensionAlive()
+                }
+
+                if !prog.isEmpty {
+                    self.connectPhase = "\(prog) · \(elapsed)с"
+                } else if let le = self.stats.lastError, !le.isEmpty {
+                    let short = le.count > 100 ? String(le.prefix(97)) + "…" : le
+                    self.connectPhase = "\(short) · \(elapsed)с"
+                } else {
+                    self.connectPhase = "TURN + DTLS… \(elapsed)с"
+                }
+            }
+
+            SharedLogger.shared.log("[AppDebug] connect watchdog: still not connected after \(limitSec)s (status=\(self.status.rawValue)) — aborting")
+            var msg = "Подключение зависло (\(limitSec)с). "
+            if let shared = UserDefaults(suiteName: "group.com.vkturnproxy.app"),
+               let be = shared.string(forKey: "bootstrap_error"), !be.isEmpty {
+                msg = be
+                shared.removeObject(forKey: "bootstrap_error")
+            } else if let le = self.stats.lastError, !le.isEmpty {
+                msg = le
+            } else if !sawExtension {
+                msg = "Extension так и не стартовал. Проверьте подпись PacketTunnel.appex и entitlement packet-tunnel."
+            } else {
+                msg += "Сервер/VK‑звонок/режим WRAP‑A. Смотрите Логи."
+            }
+            self.errorMessage = msg
+            self.connectPhase = ""
+            self.manager?.connection.stopVPNTunnel()
+            self.stopConnectWatchdog()
+        }
+    }
+
+    /// Best-effort ping: if sendProviderMessage throws, extension process is dead.
+    private func probeExtensionAlive() {
+        guard let session = manager?.connection as? NETunnelProviderSession else {
+            SharedLogger.shared.log("[AppDebug] probeExtension: no NETunnelProviderSession")
+            return
+        }
+        guard let msg = "ping".data(using: .utf8) else { return }
+        do {
+            try session.sendProviderMessage(msg) { data in
+                let reply = data.flatMap { String(data: $0, encoding: .utf8) } ?? "(nil)"
+                SharedLogger.shared.log("[AppDebug] probeExtension: reply=\(reply)")
+                if reply == "pong" || reply.contains("ok") {
+                    UserDefaults(suiteName: "group.com.vkturnproxy.app")?
+                        .set("extension: ipc alive", forKey: "bootstrap_progress")
+                }
+            }
+        } catch {
+            SharedLogger.shared.log("[AppDebug] probeExtension: send failed — \(error.localizedDescription)")
+            UserDefaults(suiteName: "group.com.vkturnproxy.app")?
+                .set("main: extension IPC failed (\(error.localizedDescription))", forKey: "bootstrap_progress")
+        }
+    }
+
+    private func stopConnectWatchdog() {
+        connectWatchdogTask?.cancel()
+        connectWatchdogTask = nil
+        connectWatchdogStartedAt = nil
     }
 
     /// Ask the extension to hit the VK API again and return a fresh
@@ -729,7 +1070,7 @@ class TunnelManager: ObservableObject {
         // the first one.
         triggerCaptchaRefresh(reason: "initial")
         captchaAutoRefreshTimer = Timer.scheduledTimer(withTimeInterval: captchaRefreshInterval, repeats: true) { [weak self] _ in
-            self?.triggerCaptchaRefresh(reason: "timer")
+            Task { @MainActor in self?.triggerCaptchaRefresh(reason: "timer") }
         }
     }
 
@@ -890,7 +1231,7 @@ class TunnelManager: ObservableObject {
                 observeStatus(existing)
             }
         } catch {
-            errorMessage = "Failed to load VPN config: \(error.localizedDescription)"
+            errorMessage = "Не удалось загрузить конфигурацию VPN: \(error.localizedDescription)"
         }
     }
 
@@ -907,6 +1248,7 @@ class TunnelManager: ObservableObject {
     private func observeStatus(_ manager: NETunnelProviderManager) {
         statusObserver.map { NotificationCenter.default.removeObserver($0) }
         status = manager.connection.status
+        syncWidgetState()
         // App-relaunch case: the tunnel may already be running in
         // .connected when we attach. NEVPNStatusDidChange only fires on
         // future transitions, so the switch below would never run for
@@ -930,11 +1272,14 @@ class TunnelManager: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self = self else { return }
-                let newStatus = manager.connection.status
+                let newStatus = self.manager?.connection.status ?? .invalid
                 self.debugLog("NEVPNStatus changed: \(newStatus.rawValue) captchaPending=\(self.captchaPending)")
                 self.status = newStatus
+                self.syncWidgetState()
                 switch newStatus {
                 case .connected:
+                    self.connectPhase = ""
+                    self.stopConnectWatchdog()
                     // Stamp the moment we first reach .connected so StatsView
                     // can render a live uptime via TimelineView. Don't reset
                     // on .connecting/.reasserting cycles inside an existing
@@ -963,6 +1308,11 @@ class TunnelManager: ObservableObject {
                         self.stopCaptchaAutoRefresh()
                     }
                 case .connecting, .reasserting:
+                    if self.connectPhase.isEmpty || self.connectPhase == "Запуск VPN…" {
+                        self.connectPhase = newStatus == .reasserting
+                            ? "Переподключение…"
+                            : "TURN + DTLS…"
+                    }
                     // CRITICAL for Step 4 architecture (deferred-setTunnelNetworkSettings):
                     // When the PoW auto-solver fails on a captcha it can't crack, the
                     // proxy goroutine surfaces the captcha redirect_uri via get_stats
@@ -985,6 +1335,7 @@ class TunnelManager: ObservableObject {
                     self.stopStatsPolling()
                     self.resetCaptchaState()
                     self.connectedAt = nil
+                    self.connectPhase = ""
                     // If the extension self-stopped due to a rejected VKAuth
                     // cookie, it wrote the reason to the App Group before
                     // cancelling — surface it (and clear it so it shows once).
@@ -992,6 +1343,13 @@ class TunnelManager: ObservableObject {
                        let ae = shared.string(forKey: "vkauth_error"), !ae.isEmpty {
                         self.errorMessage = "Сессия VK отклонена или истекла. Войдите заново в Настройках."
                         shared.removeObject(forKey: "vkauth_error")
+                    } else if let shared = UserDefaults(suiteName: "group.com.vkturnproxy.app"),
+                              let be = shared.string(forKey: "bootstrap_error"), !be.isEmpty {
+                        // Bootstrap failed inside the extension (TURN/DTLS/GETCONF).
+                        self.errorMessage = be
+                        shared.removeObject(forKey: "bootstrap_error")
+                    } else if self.errorMessage == nil, let le = self.stats.lastError, !le.isEmpty {
+                        self.errorMessage = le
                     }
                 default:
                     // .disconnecting only — keep polling/state, the tunnel
@@ -1000,6 +1358,12 @@ class TunnelManager: ObservableObject {
                 }
             }
         }
+    }
+
+    private func syncWidgetState() {
+        let suite = UserDefaults(suiteName: "group.com.vkturnproxy.app")
+        suite?.set(status == .connected, forKey: "widgetConnected")
+        suite?.set(connectPhase, forKey: "widgetPhase")
     }
 
     private func startStatsPolling(reset: Bool = true) {
@@ -1014,11 +1378,15 @@ class TunnelManager: ObservableObject {
         prevTx = 0
         prevRx = 0
         prevTime = Date()
-        // Fetch immediately, then every 2 seconds.
+        // Fetch immediately, then every 4 seconds in the energy profile
+        // (2 seconds in performance mode). Provider messages wake the app
+        // and are surprisingly expensive while the tunnel is idle.
         // Add to .common RunLoop mode so the timer fires even during
         // UI animations (e.g., SwiftUI sheet dismiss transitions).
         fetchStats()
-        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+        let energySaver = (UserDefaults.standard.object(forKey: "energySaver") as? Bool) ?? true
+        let pollingInterval = energySaver ? 4.0 : 2.0
+        let timer = Timer(timeInterval: pollingInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.fetchStats()
             }
@@ -1100,6 +1468,15 @@ class TunnelManager: ObservableObject {
                             self.errorMessage = "Сессия VK отклонена или истекла. Войдите заново в Настройках."
                             self.disconnect()
                             return
+                        }
+
+                        // Surface live TURN/DTLS failures while still connecting
+                        // instead of a silent "TURN + DTLS…" hang.
+                        if (self.status == .connecting || self.status == .reasserting
+                            || self.preBootstrapInProgress),
+                           let le = newStats.lastError, !le.isEmpty {
+                            let short = le.count > 120 ? String(le.prefix(117)) + "…" : le
+                            self.connectPhase = short
                         }
 
                         // Sync connectedAt from extension-reported uptime so
@@ -1228,22 +1605,21 @@ class TunnelManager: ObservableObject {
             using: .tcp
         )
         let queue = DispatchQueue(label: "rtt-ping")
-        var done = false
+        let gate = OneShotGate()
         connection.stateUpdateHandler = { [weak self] state in
-            guard !done else { return }
             switch state {
             case .ready:
-                done = true
+                guard gate.claim() else { return }
                 let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
                 connection.cancel()
                 Task { @MainActor in
                     self?.internetRTTms = elapsed
                 }
             case .failed(_):
-                done = true
+                guard gate.claim() else { return }
                 connection.cancel()
             case .cancelled:
-                done = true
+                _ = gate.claim()
             default:
                 break
             }
@@ -1252,8 +1628,7 @@ class TunnelManager: ObservableObject {
 
         // Timeout after 5 seconds
         queue.asyncAfter(deadline: .now() + 5) {
-            if !done {
-                done = true
+            if gate.claim() {
                 connection.cancel()
             }
         }
@@ -1330,7 +1705,12 @@ class TunnelManager: ObservableObject {
             lines.append("persistent_keepalive_interval=\(config.persistentKeepalive)")
         }
 
-        for allowedIP in config.allowedIPs.split(separator: ",") {
+        // Network Extension owns the selected routes. Keep WireGuard's
+        // cryptokey routing full-tunnel in every mode so domain entries can
+        // be resolved to fresh IPs at connect time without putting a hostname
+        // into the UAPI config (which WireGuard would reject).
+        let uapiRoutes: [Substring] = ["0.0.0.0/0", "::/0"]
+        for allowedIP in uapiRoutes {
             lines.append("allowed_ip=\(allowedIP.trimmingCharacters(in: .whitespaces))")
         }
 
@@ -1386,6 +1766,11 @@ class TunnelManager: ObservableObject {
             dict["use_wrap_a"] = true
             dict["wrap_a_password"] = config.wrapAPassword
             dict["device_id"] = wrapADeviceID()
+            // Hard mutual exclusion — leftover use_srtp=true (AppStorage default)
+            // must not ride along and confuse logs / future dispatch changes.
+            dict["use_srtp"] = false
+            dict["use_wrap"] = false
+            dict["use_wrap_s"] = false
         }
         // SRTP-WRAP-S (samosvalishe/free-turn-proxy): obf profile + Client-ID on
         // the SRTP+WRAP data path. wrap_key_hex is already set above.
@@ -1737,6 +2122,9 @@ struct TunnelConfig {
     // anonymous fallback). The cookie itself lives in the Keychain
     // (VKCookieStore); this flag flows to Go via proxy_config use_cookie_auth.
     var useCookieAuth: Bool = false
+    // true: APNs is carried through Orbit; false: APNs bypasses Orbit.
+    // The rest of the device traffic remains full-tunnel either way.
+    var proxyAPNs: Bool = false
     var numConnections: Int = 30 // configurable from Settings; VK allows ~10 simultaneous TURN allocations per cred set, so 30 conns spreads over ceil(N/10) = 3 cred sets plus a "+1 reserve" (4 total slots). 30 strikes a useful balance: enough parallelism for high-throughput single sessions, few enough to avoid overwhelming VK's per-IP rate-limit on cred refresh.
     // Per-slot cooldown after a failed fetch (typically captcha required).
     // Slot stays in cooldown for this long before being eligible to retry.

@@ -445,18 +445,18 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 	// occurs; run it in a goroutine so this export returns immediately.
 	// Start() already signals bootstrapDoneCh with the outcome.
 	go func() {
-		// Pre-bootstrap path: with seeded TURN creds the very first
-		// conn would otherwise try its DTLS handshake within ~5ms of
-		// extension launch, racing with iOS still applying the VPN
-		// network policy on .connecting transition. The kernel kills
-		// the UDP socket mid-handshake ("use of closed network
-		// connection"), DTLS times out 30s later, tunnel fails.
-		// Without seeded creds the extension's own VK API fetch takes
-		// 1-3s and provides this delay implicitly. Add an explicit
-		// 1.5s settle delay when we skipped that fetch.
+		// Pre-bootstrap path: with seeded TURN creds the first DTLS can
+		// race iOS applying VPN network policy on .connecting. Historical
+		// fix slept 1.5s (plus another 0.7s in Swift before startVPNTunnel)
+		// — Android has no equivalent and connects much faster.
+		//
+		// Brief settle so iOS finishes applying the .connecting network
+		// policy before the first DTLS packet. startConnections() also
+		// retries conn 0 on race failures. 500ms is a compromise vs the
+		// historical 1.5s (Android has none of this).
 		if seededTURN != nil {
-			log.Printf("wgStartVKBootstrap: seeded-TURN path — sleeping 1.5s before first DTLS to let iOS network policy settle")
-			time.Sleep(1500 * time.Millisecond)
+			log.Printf("wgStartVKBootstrap: seeded-TURN path — 500ms settle before first DTLS")
+			time.Sleep(500 * time.Millisecond)
 		}
 		if err := p.Start(); err != nil {
 			log.Printf("wgStartVKBootstrap: proxy.Start failed: %v", err)
@@ -484,6 +484,9 @@ func wgStartVKBootstrap(proxyConfigJSON *C.char) C.int32_t {
 //   1  → first conn established a live DTLS+TURN session
 //   0  → timeout (bootstrap still in progress; try again or give up)
 //  -1  → fatal error before any conn came up, or tunnel handle not found
+//
+// Callers should pass a modest timeout (e.g. 45–75s). Longer budgets made the
+// iOS UI appear permanently stuck on "TURN + DTLS" with no error.
 //
 // Safe to call multiple times; the internal signal is replayed so later
 // callers see the same outcome.

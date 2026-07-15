@@ -21,7 +21,7 @@ GO_LDFLAGS := -s -w
 REAL_GOROOT := $(shell go env GOROOT 2>/dev/null)
 PATCHED_GOROOT := $(BUILDDIR)/goroot
 
-.PHONY: all clean ios-device ios-simulator xcframework goroot
+.PHONY: all clean ios-device ios-simulator ios-simulator-arm64 ios-simulator-amd64 xcframework goroot
 
 all: xcframework
 
@@ -59,7 +59,7 @@ ios-device: goroot
 	@echo "==> Done: $(BUILDDIR)/libwg-turn-ios-arm64.a"
 
 # Build for iOS Simulator (arm64 for Apple Silicon)
-ios-simulator: goroot
+ios-simulator-arm64: goroot
 	@echo "==> Building for iOS Simulator (arm64)..."
 	GOROOT="$(PATCHED_GOROOT)" \
 	CGO_CFLAGS="-isysroot $(IOS_SIM_SDK) -arch arm64 -miphonesimulator-version-min=$(IOS_MIN_VERSION)" \
@@ -71,13 +71,34 @@ ios-simulator: goroot
 	go build $(GO_BUILD_FLAGS) -ldflags "$(GO_LDFLAGS)" -o $(BUILDDIR)/libwg-turn-sim-arm64.a .
 	@echo "==> Done: $(BUILDDIR)/libwg-turn-sim-arm64.a"
 
+# Build for iOS Simulator (x86_64 for Intel Macs / Hackintosh)
+ios-simulator-amd64: goroot
+	@echo "==> Building for iOS Simulator (x86_64)..."
+	GOROOT="$(PATCHED_GOROOT)" \
+	CGO_CFLAGS="-isysroot $(IOS_SIM_SDK) -arch x86_64 -miphonesimulator-version-min=$(IOS_MIN_VERSION)" \
+	CGO_LDFLAGS="-isysroot $(IOS_SIM_SDK) -arch x86_64 -miphonesimulator-version-min=$(IOS_MIN_VERSION)" \
+	GOARCH=amd64 \
+	GOOS=ios \
+	CGO_ENABLED=1 \
+	CC="$(shell xcrun --sdk iphonesimulator -f clang) -isysroot $(IOS_SIM_SDK) -arch x86_64 -miphonesimulator-version-min=$(IOS_MIN_VERSION)" \
+	go build $(GO_BUILD_FLAGS) -ldflags "$(GO_LDFLAGS)" -o $(BUILDDIR)/libwg-turn-sim-amd64.a .
+	@echo "==> Done: $(BUILDDIR)/libwg-turn-sim-amd64.a"
+
+ios-simulator: ios-simulator-arm64 ios-simulator-amd64
+	@echo "==> Creating universal Simulator archive..."
+	xcrun lipo -create \
+		$(BUILDDIR)/libwg-turn-sim-arm64.a \
+		$(BUILDDIR)/libwg-turn-sim-amd64.a \
+		-output $(BUILDDIR)/libwg-turn-sim-universal.a
+	@echo "==> Done: $(BUILDDIR)/libwg-turn-sim-universal.a"
+
 # Create XCFramework from both architectures
 xcframework: ios-device ios-simulator
 	@echo "==> Creating XCFramework..."
 	rm -rf $(DESTDIR)/WireGuardTURN.xcframework
 	xcodebuild -create-xcframework \
 		-library $(BUILDDIR)/libwg-turn-ios-arm64.a -headers $(CURDIR)/include \
-		-library $(BUILDDIR)/libwg-turn-sim-arm64.a -headers $(CURDIR)/include \
+		-library $(BUILDDIR)/libwg-turn-sim-universal.a -headers $(CURDIR)/include \
 		-output $(DESTDIR)/WireGuardTURN.xcframework
 	@echo "==> Done: $(DESTDIR)/WireGuardTURN.xcframework"
 

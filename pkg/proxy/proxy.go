@@ -151,6 +151,11 @@ type Stats struct {
 	CaptchaImageURL  string  `json:"captcha_image_url,omitempty"` // non-empty when captcha is pending
 	CaptchaSID       string  `json:"captcha_sid,omitempty"`       // captcha_sid for the pending captcha
 	AuthError        string  `json:"auth_error,omitempty"`        // non-empty when cookie (VKAuth) auth hit an unrecoverable rejection — the iOS app shows it + stops the tunnel
+	// LastError is the most recent connection/bootstrap failure reason (TURN
+	// allocate, DTLS, GETCONF, wrong mode). Surfaced to the iOS UI during
+	// .connecting so the user is not stuck staring at "TURN + DTLS" with no
+	// clue why. Cleared on successful bootstrap.
+	LastError string `json:"last_error,omitempty"`
 }
 
 // Proxy manages the DTLS+TURN tunnel to the peer server.
@@ -161,6 +166,16 @@ type Proxy struct {
 
 	peer   *net.UDPAddr
 	linkID string
+	// linkIDs: all VK call tokens from a multiline vk_link (wdtt:// can carry
+	// up to 4 hashes). fetchFreshCreds tries each on failure — a single dead
+	// call hash is a common reason Android works (uses next hash) and iOS hangs.
+	linkIDs []string
+	// lastError holds the most recent human-readable failure for GetStats.
+	lastError atomic.Value // string
+	// wrapAConfigError: set when UseWrapA was requested but password/key is
+	// invalid. Start() fails hard instead of silently falling through to
+	// SRTP/legacy (which hangs on a WRAP-A-only server until DTLS timeout).
+	wrapAConfigError error
 
 	// For packet I/O from the WireGuard side
 	sendCh chan []byte
@@ -422,16 +437,19 @@ func NewProxy(cfg Config) *Proxy {
 		}
 	}
 	// WRAP-A (amurcanov-compatible) transport: derive the obfuscation key
-	// from the password up front and ensure a stable deviceID. Disable the
-	// mode (rather than fail) on bad input so the operator sees a clear log
-	// line instead of a confusing DTLS handshake timeout.
+	// from the password up front and ensure a stable deviceID. On bad input
+	// we DO NOT silently fall through to SRTP/legacy — that causes a multi-
+	// minute DTLS hang against a WRAP-A-only server with no useful UI error.
 	var wrapAKey []byte
+	var wrapAConfigError error
 	if cfg.UseWrapA {
 		if cfg.WrapAPassword == "" {
-			log.Printf("proxy: WARN UseWrapA=true but WrapAPassword is empty — disabling WRAP-A")
+			wrapAConfigError = fmt.Errorf("WRAP-A: empty server password (import wdtt:// link or set password in Settings)")
+			log.Printf("proxy: ERROR %v", wrapAConfigError)
 			cfg.UseWrapA = false
 		} else if key, err := deriveWrapAKey(cfg.WrapAPassword); err != nil {
-			log.Printf("proxy: WARN WRAP-A key derivation failed: %v — disabling WRAP-A", err)
+			wrapAConfigError = fmt.Errorf("WRAP-A key derivation failed: %w", err)
+			log.Printf("proxy: ERROR %v", wrapAConfigError)
 			cfg.UseWrapA = false
 		} else {
 			wrapAKey = key
@@ -439,6 +457,10 @@ func NewProxy(cfg Config) *Proxy {
 				cfg.DeviceID = uuid.New().String()
 				log.Printf("proxy: WRAP-A generated session deviceID %s (bridge should persist a stable one)", cfg.DeviceID)
 			}
+			// WRAP-A is mutually exclusive with SRTP/legacy DTLS paths.
+			cfg.UseSrtp = false
+			cfg.UseWrap = false
+			cfg.UseWrapS = false
 			log.Printf("proxy: WRAP-A (amurcanov-compatible) mode enabled — server provisions WireGuard via GETCONF")
 		}
 	}
@@ -472,9 +494,13 @@ func NewProxy(cfg Config) *Proxy {
 		startedAt:         time.Now(),
 	}
 	// Wire up WRAP-A state on the constructed proxy (key + provision channel).
+	p.wrapAConfigError = wrapAConfigError
 	if cfg.UseWrapA {
 		p.wrapAKey = wrapAKey
 		p.wrapAProvCh = make(chan struct{})
+	}
+	if wrapAConfigError != nil {
+		p.setLastError(wrapAConfigError.Error())
 	}
 	// If no external solver provided, use the built-in channel-based solver
 	// that waits for SolveCaptcha() to be called (e.g. from iOS UI).
@@ -531,8 +557,27 @@ func NewProxy(cfg Config) *Proxy {
 // user may still solve it and a conn will come up via Resume()).
 func (p *Proxy) signalBootstrapDone(err error) {
 	p.bootstrapDoneOnce.Do(func() {
+		if err != nil {
+			p.setLastError(err.Error())
+			log.Printf("proxy: bootstrap FAILED: %v", err)
+		} else {
+			p.setLastError("")
+		}
 		p.bootstrapDoneCh <- err
 	})
+}
+
+func (p *Proxy) setLastError(msg string) {
+	p.lastError.Store(msg)
+}
+
+func (p *Proxy) getLastError() string {
+	if v := p.lastError.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
 }
 
 // WaitBootstrap blocks until bootstrap is ready, a fatal error occurred,
@@ -565,31 +610,51 @@ func (p *Proxy) Start() error {
 		return nil
 	}
 
-	// Limit Go scheduler threads to reduce CPU wakeups on iOS.
-	// iOS Network Extensions are killed if they exceed 45000 wakeups/300s.
-	// With 10 connections and ~50 goroutines, unrestricted GOMAXPROCS
-	// causes ~1500 wakes/sec. Limiting to 2 threads keeps us well under.
-	runtime.GOMAXPROCS(2)
+	// Bootstrap uses a few more OS threads so DTLS/crypto and TURN alloc
+	// don't serialize on a single core (Android has no GOMAXPROCS=2 clamp
+	// and feels snappier). After the first conn is up we drop to 2 for
+	// steady-state: unrestricted GOMAXPROCS with 30 conns can exceed iOS
+	// NE wakeup budgets (~45000/300s) and get the extension jetsam'd.
+	ncpu := runtime.NumCPU()
+	if ncpu < 2 {
+		ncpu = 2
+	}
+	if ncpu > 4 {
+		ncpu = 4
+	}
+	runtime.GOMAXPROCS(ncpu)
 
-	// Parse VK link ID
-	linkID := p.config.VKLink
-	if strings.Contains(linkID, "join/") {
-		parts := strings.Split(linkID, "join/")
-		linkID = parts[len(parts)-1]
+	// Fail fast if WRAP-A was requested but misconfigured (empty password etc).
+	// Without this we fall into SRTP/legacy and hang on DTLS against a WDTT server.
+	if p.wrapAConfigError != nil {
+		p.signalBootstrapDone(p.wrapAConfigError)
+		return p.wrapAConfigError
 	}
-	if idx := strings.IndexAny(linkID, "/?#"); idx != -1 {
-		linkID = linkID[:idx]
+
+	// Parse VK call tokens. Supports multiline (one hash/URL per line) from
+	// wdtt:// links that carry multiple hashes.
+	p.linkIDs = parseVKLinkIDs(p.config.VKLink)
+	if len(p.linkIDs) == 0 {
+		wrapped := fmt.Errorf("no VK call link / hash configured")
+		p.signalBootstrapDone(wrapped)
+		return wrapped
 	}
-	p.linkID = linkID
+	p.linkID = p.linkIDs[0]
+	if len(p.linkIDs) > 1 {
+		log.Printf("proxy: %d VK call hashes configured — will fall back on failure", len(p.linkIDs))
+	}
 
 	// Resolve peer address
 	peer, err := net.ResolveUDPAddr("udp", p.config.PeerAddr)
 	if err != nil {
-		wrapped := fmt.Errorf("resolve peer: %w", err)
+		wrapped := fmt.Errorf("resolve peer %q: %w", p.config.PeerAddr, err)
 		p.signalBootstrapDone(wrapped)
 		return wrapped
 	}
 	p.peer = peer
+	log.Printf("proxy: peer=%s mode wrapA=%v srtp=%v wrap=%v wrapS=%v dtls=%v udp=%v conns=%d",
+		p.config.PeerAddr, p.config.UseWrapA, p.config.UseSrtp, p.config.UseWrap, p.config.UseWrapS,
+		p.config.UseDTLS, p.config.UseUDP, p.config.NumConns)
 
 	// Start watchdog goroutine to detect dead tunnels after iOS freeze/thaw.
 	// This is the primary self-healing mechanism — it doesn't rely on iOS
@@ -653,6 +718,9 @@ func (p *Proxy) Start() error {
 		// so they don't sit on the channel until timeout.
 		p.signalBootstrapDone(err)
 	}
+	// Steady-state: clamp scheduler after first-conn attempt finishes
+	// (success or captcha-pending). Keeps wakeups down for the NE lifetime.
+	runtime.GOMAXPROCS(2)
 	// Success (first conn ready) is signaled from runConnection itself, so
 	// WaitBootstrap reflects reality even in the captcha-retry path where
 	// startConnections returns nil while the first conn is still coming up.
@@ -822,6 +890,7 @@ func (p *Proxy) startConnections() error {
 			defer p.wg.Done()
 			err := p.runConnection(sessCtx, p.linkID, readyCh, 0)
 			if err != nil {
+				p.setLastError(err.Error())
 				select {
 				case errCh <- err:
 				default:
@@ -829,63 +898,33 @@ func (p *Proxy) startConnections() error {
 			}
 		}()
 
+		// Hard cap: a hung Allocate()/DTLS without return used to block
+		// bootstrap forever (UI stuck on "TURN + DTLS"). Fail the attempt
+		// so the retry loop / WaitBootstrap can surface an error.
+		const conn0AttemptBudget = 22 * time.Second
 		select {
 		case <-readyCh:
 			return nil
 		case err := <-errCh:
 			return err
+		case <-time.After(conn0AttemptBudget):
+			p.setLastError(fmt.Sprintf("conn0 hung >%s (TURN allocate or DTLS not finishing)", conn0AttemptBudget))
+			return fmt.Errorf("conn0 bootstrap hung after %s — TURN/DTLS not completing (server down, wrong mode, or dead VK call)", conn0AttemptBudget)
 		case <-p.ctx.Done():
 			return p.ctx.Err()
 		}
 	}
 
 	// Bootstrap retry loop — conn 0's first DTLS+TURN handshake can fail
-	// transiently for several network reasons:
-	//   - iOS VPN policy applied mid-handshake (kernel closes the UDP
-	//     socket under us; surfaces as "broken pipe" / "use of closed
-	//     network connection"). The 1.5s settle delay in
-	//     wgStartVKBootstrap isn't always enough.
-	//   - WiFi handover / DHCP setup not finished when bootstrap begins.
-	//   - Carrier-grade NAT mapping warmup on cellular reconnect.
-	//   - Slow DNS or routing convergence on a fresh network.
-	//
-	// Up to 4 attempts × 15s DTLS handshake timeout + 3 backoffs × 10s
-	// = ~90s total. Linear backoff (not exponential): each attempt has
-	// the same cost, so spreading evenly is fine.
-	//
-	// Retry triggers on ANY error EXCEPT captcha — captcha needs a user
-	// answer, retrying immediately just burns budget. Captcha-required
-	// drops out of this loop and surfaces via the captcha-pending path
-	// below.
-	const maxBootstrapAttempts = 7
-	// Linear-progressive backoff for the non-saturated retry path. The
-	// backoff before retrying into attempt N (N=2..7) is (N-1) * 10s:
-	// 10, 20, 30, 40, 50, 60 seconds. Cumulative timeline of attempt
-	// starts (5s dial timeout per attempt + the backoff before next):
-	//   attempt 1: t=0   (initial)
-	//   attempt 2: t=15  (5s dial + 10s wait)
-	//   attempt 3: t=40  (15 + 5 dial + 20 wait)
-	//   attempt 4: t=75
-	//   attempt 5: t=120
-	//   attempt 6: t=175
-	//   attempt 7: t=240 (4 minutes)
-	// Total bootstrap budget when all 7 fail: ~245s = ~4m5s.
-	//
-	// Rationale: pre-build-137 was maxBootstrapAttempts=4 with fixed
-	// 10s backoff = ~60s total. When network outages last >60s (e.g.
-	// 2026-05-26 02:21-02:35 ~14 min ISP/route flap on user's WiFi
-	// — see progress_summary_may_25_2026 evening notes / open issue),
-	// the 60s budget exhausts and we wait for watchdog Condition 3
-	// to fire after 5 min of zero active conns, giving 5-6 min total
-	// dead-window per cycle. The 4-min budget here covers most
-	// transient network outages (most ISPs recover within 1-2 min),
-	// and if it still fails the watchdog cycle adds another ~1 min
-	// gap, NOT 5 min — bootstrap is doing the waiting work, not
-	// idling. For recoveries that happen mid-bootstrap-budget, the
-	// next attempt catches the recovery within at most 60s instead
-	// of waiting for the next 5-min watchdog tick.
+	// transiently (iOS NECP race, WiFi handover, etc.). Keep the budget
+	// SHORT so the iOS UI does not sit on "TURN + DTLS…" forever:
+	//   3 attempts × ~22s + backoffs 1s+2s ≈ under 70s, then fail hard.
+	// Mid-session recovery after that is the watchdog's job, not the
+	// initial connect UX.
+	const maxBootstrapAttempts = 3
 	bootstrapBackoff := func(failedAttempt int) time.Duration {
-		return time.Duration(failedAttempt) * 10 * time.Second
+		// 1s, 2s — fail fast on first connect; long outages recover via watchdog.
+		return time.Duration(failedAttempt) * time.Second
 	}
 	// Safety window beyond longest cooldown — guards against slot timer
 	// firing slightly after our calculated deadline (re-arms, scheduler
@@ -984,6 +1023,7 @@ func (p *Proxy) startConnections() error {
 		var captchaErr *CaptchaRequiredError
 		if errors.As(err, &captchaErr) {
 			log.Printf("proxy: captcha required during startup, waiting for solution")
+			p.setLastError("Нужна капча VK (решайте в приложении или сбросьте кэш TURN)")
 			p.captchaImageURL.Store(captchaErr.ImageURL)
 			p.lastCaptchaSID.Store(captchaErr.SID)
 			p.lastCaptchaTs.Store(captchaErr.CaptchaTs)
@@ -1018,7 +1058,10 @@ func (p *Proxy) startConnections() error {
 	// For NumConns ≤ burstSize, the slow branch is never taken and
 	// behaviour matches the previous linear stagger (200ms × i).
 	const burstSize = 10
-	const burstStagger = 200 * time.Millisecond
+	// 100ms burst stagger: first ~10 conns come up ~1s faster than the old
+	// 200ms cadence. VK's allocation token bucket still tolerates this
+	// (empirical 10-alloc burst); if 486 quota appears, grower/retry handle it.
+	const burstStagger = 100 * time.Millisecond
 	const slowStagger = 5 * time.Second
 	for i := 1; i < p.config.NumConns; i++ {
 		p.wg.Add(1)
@@ -1596,7 +1639,57 @@ func (p *Proxy) GetStats() Stats {
 		CaptchaImageURL:   captchaURL,
 		CaptchaSID:        captchaSID,
 		AuthError:         CookieAuthFatalError(),
+		LastError:         p.getLastError(),
 	}
+}
+
+// parseVKLinkIDs extracts call tokens from a vk_link field that may contain
+// multiple URLs or bare hashes separated by newlines (and tolerates commas).
+func parseVKLinkIDs(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	// Split on newlines first, then commas inside each line.
+	var out []string
+	seen := map[string]bool{}
+	for _, line := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ','
+	}) {
+		id := extractCallToken(line)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+func extractCallToken(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if strings.Contains(s, "join/") {
+		parts := strings.Split(s, "join/")
+		s = parts[len(parts)-1]
+	}
+	if idx := strings.IndexAny(s, "/?# \t"); idx != -1 {
+		s = s[:idx]
+	}
+	s = strings.Trim(s, "/")
+	if s == "" || s == "REPLACE_ME" {
+		return ""
+	}
+	return s
+}
+
+func truncateID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
 }
 
 // waitForCaptchaAnswer is the built-in CaptchaSolver that publishes the captcha
@@ -2044,11 +2137,48 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURN
 	// savedClientID="" preserves existing mid-session behavior — proxy.go
 	// doesn't track client_id on captcha-retry today (independent of the
 	// pre-bootstrap captcha flow which does pin client_id strictly).
-	c, err := GetVKCreds(p.linkID, solver, solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1, "")
-	if err != nil {
-		return "", nil, fmt.Errorf("get VK creds: %w", err)
+	//
+	// Try every configured VK call hash. Dead/expired first hash is a very
+	// common hang cause when wdtt:// carries 2–4 hashes and only the first
+	// was used.
+	ids := p.linkIDs
+	if len(ids) == 0 && p.linkID != "" {
+		ids = []string{p.linkID}
 	}
-	creds = c
+	var lastCredErr error
+	for i, id := range ids {
+		// Only pass captcha state on the first attempt — tokens are bound to
+		// a specific call session.
+		sid, key, ts, att, tok := solvedSID, solvedKey, solvedTs, solvedAttempt, savedToken1
+		if i > 0 {
+			sid, key, ts, att, tok = "", "", 0, 0, ""
+		}
+		c, err := GetVKCreds(id, solver, sid, key, ts, att, tok, "")
+		if err != nil {
+			lastCredErr = err
+			log.Printf("proxy: GetVKCreds hash[%d]=%s… failed: %v", i, truncateID(id), err)
+			// Captcha needs the user — don't burn through other hashes with
+			// the same captcha session; surface immediately.
+			var captchaErr *CaptchaRequiredError
+			if errors.As(err, &captchaErr) {
+				return "", nil, err
+			}
+			continue
+		}
+		if i > 0 {
+			log.Printf("proxy: GetVKCreds succeeded with fallback hash[%d]=%s…", i, truncateID(id))
+		}
+		p.linkID = id
+		creds = c
+		break
+	}
+	if creds == nil {
+		if lastCredErr != nil {
+			p.setLastError(fmt.Sprintf("VK creds: %v", lastCredErr))
+			return "", nil, fmt.Errorf("get VK creds: %w", lastCredErr)
+		}
+		return "", nil, fmt.Errorf("get VK creds: no call hashes configured")
+	}
 	} // end else (anonymous path)
 	// Apply the "TURN server" override (Settings → optional turn_server/
 	// turn_port; empty = no override) to every VK-returned address. This is
