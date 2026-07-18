@@ -127,3 +127,16 @@ docs/               дополнительная документация
 Orbit основан на [anton48/vk-turn-proxy-ios](https://github.com/anton48/vk-turn-proxy-ios) и сохраняет совместимость с экосистемой WDTT, включая [amurcanov/proxy-turn-vk-android](https://github.com/amurcanov/proxy-turn-vk-android) и [SpaceNeuroX/proxy-turn-vk-android](https://github.com/SpaceNeuroX/proxy-turn-vk-android).
 
 Проект распространяется по [GPL-3.0](LICENSE). Если вы публикуете изменённую версию, сохраните лицензию и укажите исходный проект.
+
+---
+
+## ⭐ Star History
+
+<a href="https://star-history.com/#Lendic42/Orbit&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Lendic42/Orbit&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Lendic42/Orbit&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Lendic42/Orbit&type=Date" />
+  </picture>
+</a>
+
