@@ -132,5 +132,5 @@ Orbit основан на [anton48/vk-turn-proxy-ios](https://github.com/anton48
 
 ## ⭐ Star History
 
-[![Star History Chart](./star-history.svg)](https://www.star-history.com/#Orbit&Date)
+[![Star History Chart](./star-history.png)](https://www.star-history.com/#Orbit&Date)
 
