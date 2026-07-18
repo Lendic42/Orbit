@@ -132,11 +132,5 @@ Orbit основан на [anton48/vk-turn-proxy-ios](https://github.com/anton48
 
 ## ⭐ Star History
 
-<a href="https://star-history.com/#Lendic42/Orbit&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Lendic42/Orbit&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Lendic42/Orbit&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Lendic42/Orbit&type=Date" />
-  </picture>
-</a>
+[![Star History Chart](./star-history.svg)](https://www.star-history.com/#Orbit&Date)
 
